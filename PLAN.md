@@ -160,15 +160,18 @@
 
 ## Phase 9: Day-2 运维与可观测性 (Operations & Observability)
 - 设计: 二级索引: `CREATE INDEX name ON t(col)` (非唯一，单列，NULL 不入索引)。索引树的 key = 列值保序编码 + 主键，value 为空；
-  索引项只增不删 (回滚时仅撤销本次新增的项)，读取时回表取可见版本并校验列值仍匹配，因此对 MVCC 安全；优化器的访问路径加入二级索引。
+  索引项只增不删 (回滚时仅撤销本次新增的项)，读取时回表取可见版本并校验列值仍匹配，因此对 MVCC 安全。
+  索引记录创建时的事务号 `ValidFrom`: 只有在索引创建之后建立的 Read View 才能用它做快照读 (旧视图可能需要未被索引的旧值)，当前读 (UPDATE/DELETE/FOR UPDATE) 不受限。
+  优化器的访问路径加入二级索引 (代价模型: 索引范围 I/O + 每行回表)；UPDATE/DELETE/加锁读也可用索引定位候选行。
 - 设计: Online DDL (影子拷贝 + 增量回放): `ALTER TABLE t ADD COLUMN c type [DEFAULT lit]` 与 `CREATE INDEX`。
-  ① 订阅提交事件 (复用 Phase 5 的行事件) 开始捕获 → ② 用快照分批拷贝到影子表/影子索引 → ③ 回放捕获的增量 (多轮至队列很小) → ④ 对表加元数据锁 X (等待已触及该表的事务结束，期间新事务短暂阻塞) → 回放最后增量 → ⑤ 在 Catalog 中原子切换 → 释放。
-  元数据锁 (MDL): 写事务在首次触及表时对 `mdl:<表>` 加 S 锁直到事务结束；读语句只在语句期间持有；DDL 切换时加 X。集群中 DDL 以 DDL 事件复制，跟随者同步执行。
-- 设计: 热备份 (物理，模糊但可重放): 先做 Fuzzy Checkpoint 并暂停 WAL 截断，记录 startLSN 与 binlog 位置 → 拷贝数据页 (校验和失败则重读) → 刷日志后拷贝 WAL、`.dw`，最后拷贝文件头页 → 清单 `manifest.json`。
-  增量备份只拷贝 `页 LSN > 上次备份 endLSN` 的页。还原 = 基础备份 + 依次覆盖增量页 + 用最后一份的 WAL，打开数据库时由崩溃恢复完成重放。
-- 设计: PITR: 在还原后的库上重放 Binlog (按序号/提交时间戳) 直到目标时间点；目标时间必须不早于该备份完成时间。SQL 入口: `BACKUP TO 'dir' [INCREMENTAL FROM 'basedir']`；还原由离线命令行 `mysqlfake restore` 完成。
+  ① 订阅提交事件 (复用 Phase 5 的行事件) 开始捕获 → ② 用快照分批拷贝到影子表/影子索引 → ③ 回放捕获的增量 (多轮至队列很小) → ④ 对表加元数据锁 X (等待已触及该表的事务结束，期间新事务短暂阻塞) → 回放最后增量 → ⑤ 在 Catalog 中原子切换 → ⑥ 写 DDL 事件 (经 Raft 复制，失败则在持有 X 锁时撤销切换) → 释放。
+  元数据锁 (MDL): 写事务在首次触及表时 (先于读取 TableInfo) 对 `mdl:<表>` 加 S 锁直到事务结束；读语句不加。同一时刻只允许一个在线 DDL。集群中 DDL 以 DDL 事件复制，跟随者同步执行。
+- 设计: 热备份 (物理，模糊但可重放): 先做 Fuzzy Checkpoint 并暂停 WAL 截断，记录 startLSN 与 binlog 位置 → 拷贝数据页 (校验和失败则重读) → 刷日志后拷贝 WAL 与 binlog，**最后**拷贝文件头页 → 清单 `MANIFEST.json`。
+  增量备份只拷贝 `页 LSN > 上次备份 endLSN` 的页。还原 = 基础备份 + 依次覆盖增量页 + 把链上所有备份的 WAL 合并 (按 LSN 去重)，打开数据库时由崩溃恢复完成重放。
+  包划分: `backup/` 放备份格式与文件级操作 (清单、页覆盖、WAL 合并)，与引擎交互的部分 (`Engine.Backup`、`RestoreTo`/PITR) 在 `db/`。
+- 设计: PITR: 在还原后的库上重放 Binlog (按序号/提交时间戳) 直到目标时间点；目标时间必须不早于最后一份备份的完成时间。SQL 入口: `BACKUP TO 'dir' [INCREMENTAL FROM 'basedir']`；还原由离线命令行 `mysqlfake restore` 完成。
 - 设计: 观测: `metrics/` 提供计数器/仪表/直方图并以 Prometheus 文本格式在 HTTP `/metrics` 暴露 (语句数/QPS、缓冲池命中、锁等待、事务提交/回滚/死锁、WAL 字节与 fsync、连接数、Raft 角色/任期/提交位置等)；
-  慢查询日志按阈值写文件 (耗时、扫描行数、返回行数、阶段耗时)；Profiling: 阶段耗时 (parse/plan/execute/锁等待) + `EXPLAIN ANALYZE` 的逐算子行数与耗时。
+  慢查询日志按阈值写文件 (耗时、扫描行数、返回行数、阶段耗时)；Profiling: 每条语句的阶段耗时 (parse/plan/execute/锁等待) 和扫描/返回行数 (`Session.LastProfile`)，`EXPLAIN ANALYZE` 给出逐算子的实际行数与耗时。
 - [ ] **9.1 在线变更 (Online DDL)**
   - [ ] 实现二级索引 (存储、DML 维护、回滚、优化器访问路径)
   - [ ] 实现无锁加列、建索引机制 (影子表拷贝 + 增量日志回放) 及元数据锁
@@ -178,4 +181,5 @@
 - [ ] **9.3 系统观测**
   - [ ] 接入 Prometheus 兼容的 Metrics 暴露接口 (QPS, 缓冲池命中率, 锁等待)
   - [ ] 实现 Slow Query Log (慢查询日志) 与执行耗时细粒度 Profiling
-- 已知限制: 二级索引项不清理 (无 purge)；无 DROP INDEX/DROP COLUMN；备份期间 WAL 不截断，磁盘占用上升；PITR 目标点之前的备份必须存在。
+- 已知限制: 二级索引项不清理 (无 purge)；无 DROP INDEX/DROP COLUMN；备份期间 WAL 不截断，磁盘占用上升；PITR 目标点之前的备份必须存在；
+  Online DDL 切换时刻之前开启的快照事务，切换后会读到切换时刻的数据 (不保持其快照)；集群里 DDL 复制失败时只能在 X 锁内撤销。
