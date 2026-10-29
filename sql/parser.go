@@ -112,7 +112,30 @@ func (p *parser) statement() (Statement, error) {
 		return &CommitStmt{}, nil
 	case p.acceptKw("ROLLBACK"):
 		return &RollbackStmt{}, nil
+	case p.acceptKw("ALTER"):
+		return p.alterTable()
+	case p.acceptKw("BACKUP"):
+		if err := p.expectKw("TO"); err != nil {
+			return nil, err
+		}
+		t := p.next()
+		if t.kind != tString {
+			return nil, p.errf("expected a quoted directory after TO")
+		}
+		st := &BackupStmt{Dir: t.text}
+		if p.acceptKw("INCREMENTAL") {
+			if err := p.expectKw("FROM"); err != nil {
+				return nil, err
+			}
+			f := p.next()
+			if f.kind != tString {
+				return nil, p.errf("expected a quoted directory after FROM")
+			}
+			st.From = f.text
+		}
+		return st, nil
 	case p.acceptKw("EXPLAIN"):
+		analyze := p.acceptKw("ANALYZE")
 		if err := p.expectKw("SELECT"); err != nil {
 			return nil, err
 		}
@@ -120,7 +143,7 @@ func (p *parser) statement() (Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ExplainStmt{Select: sel.(*SelectStmt)}, nil
+		return &ExplainStmt{Select: sel.(*SelectStmt), Analyze: analyze}, nil
 	case p.acceptKw("ANALYZE"):
 		if err := p.expectKw("TABLE"); err != nil {
 			return nil, err
@@ -139,7 +162,69 @@ func (p *parser) statement() (Statement, error) {
 	return nil, p.errf("unsupported statement %q", p.peek().text)
 }
 
+func (p *parser) createIndex() (Statement, error) {
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("ON"); err != nil {
+		return nil, err
+	}
+	table, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectSym("("); err != nil {
+		return nil, err
+	}
+	col, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectSym(")"); err != nil {
+		return nil, err
+	}
+	return &CreateIndexStmt{Name: name, Table: table, Column: col}, nil
+}
+
+func (p *parser) alterTable() (Statement, error) {
+	if err := p.expectKw("TABLE"); err != nil {
+		return nil, err
+	}
+	table, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("ADD"); err != nil {
+		return nil, err
+	}
+	p.acceptKw("COLUMN")
+	def, err := p.columnDef()
+	if err != nil {
+		return nil, err
+	}
+	if def.PrimaryKey {
+		return nil, p.errf("cannot add a PRIMARY KEY column")
+	}
+	st := &AlterTableStmt{Table: table, Add: def}
+	if p.acceptKw("DEFAULT") {
+		e, err := p.atom()
+		if err != nil {
+			return nil, err
+		}
+		lit, ok := e.(*Literal)
+		if !ok {
+			return nil, p.errf("DEFAULT must be a literal")
+		}
+		st.Default = lit
+	}
+	return st, nil
+}
+
 func (p *parser) createTable() (Statement, error) {
+	if p.acceptKw("INDEX") {
+		return p.createIndex()
+	}
 	if err := p.expectKw("TABLE"); err != nil {
 		return nil, err
 	}
@@ -152,36 +237,9 @@ func (p *parser) createTable() (Statement, error) {
 	}
 	st := &CreateTableStmt{Table: name}
 	for {
-		col, err := p.ident()
+		def, err := p.columnDef()
 		if err != nil {
 			return nil, err
-		}
-		def := ColumnDef{Name: col}
-		switch {
-		case p.acceptKw("INT"), p.acceptKw("INTEGER"), p.acceptKw("BIGINT"):
-			def.Type = tuple.TypeInt
-		case p.acceptKw("VARCHAR"):
-			def.Type = tuple.TypeVarchar
-			if err := p.expectSym("("); err != nil {
-				return nil, err
-			}
-			t := p.next()
-			n, perr := strconv.Atoi(t.text)
-			if t.kind != tInt || perr != nil || n <= 0 || n > 1000 {
-				return nil, p.errf("invalid VARCHAR length %q (1..1000)", t.text)
-			}
-			def.Len = n
-			if err := p.expectSym(")"); err != nil {
-				return nil, err
-			}
-		default:
-			return nil, p.errf("expected column type, got %q", p.peek().text)
-		}
-		if p.acceptKw("PRIMARY") {
-			if err := p.expectKw("KEY"); err != nil {
-				return nil, err
-			}
-			def.PrimaryKey = true
 		}
 		st.Columns = append(st.Columns, def)
 		if p.acceptSym(",") {
@@ -193,6 +251,42 @@ func (p *parser) createTable() (Statement, error) {
 		return nil, err
 	}
 	return st, nil
+}
+
+// columnDef 解析 "name type [PRIMARY KEY]"。
+func (p *parser) columnDef() (ColumnDef, error) {
+	col, err := p.ident()
+	if err != nil {
+		return ColumnDef{}, err
+	}
+	def := ColumnDef{Name: col}
+	switch {
+	case p.acceptKw("INT"), p.acceptKw("INTEGER"), p.acceptKw("BIGINT"):
+		def.Type = tuple.TypeInt
+	case p.acceptKw("VARCHAR"):
+		def.Type = tuple.TypeVarchar
+		if err := p.expectSym("("); err != nil {
+			return def, err
+		}
+		t := p.next()
+		n, perr := strconv.Atoi(t.text)
+		if t.kind != tInt || perr != nil || n <= 0 || n > 1000 {
+			return def, p.errf("invalid VARCHAR length %q (1..1000)", t.text)
+		}
+		def.Len = n
+		if err := p.expectSym(")"); err != nil {
+			return def, err
+		}
+	default:
+		return def, p.errf("expected column type, got %q", p.peek().text)
+	}
+	if p.acceptKw("PRIMARY") {
+		if err := p.expectKw("KEY"); err != nil {
+			return def, err
+		}
+		def.PrimaryKey = true
+	}
+	return def, nil
 }
 
 func (p *parser) insert() (Statement, error) {

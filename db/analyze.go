@@ -112,5 +112,20 @@ func (e *Engine) PlanQuery(query string) (*optimizer.Plan, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	return e.def.plan(&executor.Ctx{Txn: tx, Mgr: e.mgr}, sel)
+	return e.def.plan(&executor.Ctx{Txn: tx, Mgr: e.mgr}, sel, false)
+}
+
+// Describe 返回表的列名和索引名 (诊断/测试用)。
+func (e *Engine) Describe(table string) (columns, indexes []string, err error) {
+	ti, err := e.cat.GetTable(table)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, c := range ti.Schema.Columns {
+		columns = append(columns, c.Name)
+	}
+	for _, ix := range ti.Indexes {
+		indexes = append(indexes, ix.Name)
+	}
+	return columns, indexes, nil
 }

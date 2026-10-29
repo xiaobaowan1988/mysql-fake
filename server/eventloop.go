@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"mysqlfake/metrics"
 )
 
 // evConn 是事件循环里的一个连接。除 pc 之外的所有字段只会被事件循环 goroutine 访问；
@@ -140,6 +142,7 @@ func (l *eventLoop) accept() {
 			syscall.Write(fd, framePacket(nil, &seq, errPayload(errTooManyConns, "08004", "Too many connections")))
 			syscall.Close(fd)
 			s.rejected.Add(1)
+			metrics.ConnRejected.Inc()
 			continue
 		}
 		pc := newProtoConn(s.cfg.Engine)

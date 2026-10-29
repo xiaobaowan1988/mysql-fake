@@ -452,7 +452,7 @@ func TestTxnCrashRecoveryAndIDsRestart(t *testing.T) {
 	sexec(t, s, "DELETE FROM acc WHERE id = 2")
 	sexec(t, s, "INSERT INTO acc VALUES (4,4,'d')")
 	sexec(t, s, "COMMIT")
-	lastID := e.mgr.NextIDForTest()
+	lastID := e.mgr.NextID()
 	e.crash()
 
 	e, err = OpenWithOptions(path, Options{PoolSize: 512})
@@ -463,8 +463,8 @@ func TestTxnCrashRecoveryAndIDsRestart(t *testing.T) {
 	if got := rowsOf(mustExec(t, e, "SELECT id, bal FROM acc")); got != "1,1;3,300;4,4" {
 		t.Fatalf("committed txn lost: %s", got)
 	}
-	if e.mgr.NextIDForTest() < lastID {
-		t.Fatalf("txn ids must not be reused after restart: %d < %d", e.mgr.NextIDForTest(), lastID)
+	if e.mgr.NextID() < lastID {
+		t.Fatalf("txn ids must not be reused after restart: %d < %d", e.mgr.NextID(), lastID)
 	}
 	// 重启后旧版本可见，新事务可继续读写
 	mustExec(t, e, "UPDATE acc SET bal = bal + 1 WHERE id = 1")

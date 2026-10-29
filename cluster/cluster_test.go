@@ -363,3 +363,40 @@ func TestFullClusterRestart(t *testing.T) {
 	c.must(l, "INSERT INTO t VALUES (3,'c')")
 	c.converge("SELECT * FROM t", "1,a;2,z;3,c")
 }
+
+func TestOnlineDDLIsReplicated(t *testing.T) {
+	c := newTC(t, 3, ModeSync)
+	l := c.leader()
+	c.must(l, "CREATE TABLE t (id INT PRIMARY KEY, k INT)")
+	for i := 0; i < 50; i++ {
+		c.must(l, fmt.Sprintf("INSERT INTO t VALUES (%d,%d)", i, i%5))
+	}
+	c.must(l, "CREATE INDEX ik ON t (k)")
+	c.must(l, "ALTER TABLE t ADD COLUMN extra INT DEFAULT 9")
+	c.must(l, "INSERT INTO t VALUES (100, 3, 1)")
+	c.must(l, "UPDATE t SET extra = 4 WHERE id = 0")
+	want := dump(t, l, "SELECT id, k, extra FROM t ORDER BY id")
+	c.converge("SELECT id, k, extra FROM t ORDER BY id", want)
+	for id, nd := range c.nodes {
+		cols, idx, err := nd.Engine().Describe("t")
+		if err != nil || strings.Join(cols, ",") != "id,k,extra" || strings.Join(idx, ",") != "ik" {
+			t.Fatalf("node %d schema: %v %v %v", id, cols, idx, err)
+		}
+		// 副本上索引同样被维护并可用于查询
+		if got := dump(t, nd, "SELECT id FROM t WHERE k = 3 ORDER BY id"); !strings.Contains(got, "100") {
+			t.Fatalf("node %d index query: %s", id, got)
+		}
+	}
+	// 重启一个跟随者后，通过日志重放重新得到相同的结构
+	var victim int
+	for id, nd := range c.nodes {
+		if nd != l {
+			victim = id
+			break
+		}
+	}
+	c.stop(victim)
+	c.must(l, "INSERT INTO t VALUES (101, 3, 2)")
+	c.start(victim)
+	c.converge("SELECT id FROM t WHERE k = 3 ORDER BY id", dump(t, l, "SELECT id FROM t WHERE k = 3 ORDER BY id"))
+}

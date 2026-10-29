@@ -20,6 +20,15 @@ type LockScan struct {
 	pred       Expr
 	mode       txn.LockMode
 	it         *btree.Iterator
+
+	// 二级索引候选: idx 非空时遍历索引范围 [start, end) 取主键 (去重)，谓词会在加锁后用最新值重新校验
+	idx  *catalog.IndexInfo
+	seen map[string]bool
+}
+
+// NewLockIndexScan 与 NewLockScan 相同，但候选行来自二级索引的键范围。
+func NewLockIndexScan(ctx *Ctx, t *catalog.TableInfo, ix *catalog.IndexInfo, start, end []byte, pred Expr, mode txn.LockMode) *LockScan {
+	return &LockScan{ctx: ctx, table: t, start: start, end: end, pred: pred, mode: mode, idx: ix}
 }
 
 func NewLockScan(ctx *Ctx, t *catalog.TableInfo, start, end []byte, pred Expr, mode txn.LockMode) *LockScan {
@@ -27,6 +36,11 @@ func NewLockScan(ctx *Ctx, t *catalog.TableInfo, start, end []byte, pred Expr, m
 }
 
 func (s *LockScan) Init() error {
+	if s.idx != nil {
+		s.it = s.idx.Tree.Scan(s.start, s.end)
+		s.seen = map[string]bool{}
+		return nil
+	}
 	s.it = s.table.Tree.Scan(s.start, s.end)
 	return nil
 }
@@ -34,9 +48,21 @@ func (s *LockScan) Init() error {
 func (s *LockScan) Next() (*Row, error) {
 	for s.it.Next() {
 		key := append([]byte(nil), s.it.Key()...)
+		if s.idx != nil {
+			_, pk, err := tuple.SplitIndexKey(s.table.Schema.Columns[s.idx.Column].Type, key)
+			if err != nil {
+				return nil, err
+			}
+			key = append([]byte(nil), pk...)
+			if s.seen[string(key)] {
+				continue
+			}
+			s.seen[string(key)] = true
+		}
 		if err := s.ctx.Txn.Lock(lockKey(s.table.Name, key), s.mode); err != nil {
 			return nil, err
 		}
+		s.ctx.Examined(1)
 		raw, ok, err := s.table.Tree.Get(key)
 		if err != nil {
 			return nil, err
@@ -102,7 +128,12 @@ func (in *Insert) Next() (*Row, error) {
 			return nil, err
 		}
 		if !found {
-			tx.AddUndo(txn.UndoInsert, in.table.Name, tree, key, nil, data)
+			adds, aerr := addIndexEntries(in.table, key, nil, vals)
+			if aerr != nil {
+				tx.AddUndo(txn.UndoInsert, in.table.Name, tree, key, nil, data, adds...) // 让已加的索引项随语句回滚撤销
+				return nil, aerr
+			}
+			tx.AddUndo(txn.UndoInsert, in.table.Name, tree, key, nil, data, adds...)
 			err = tree.Insert(key, txn.RowVersion{TxnID: tx.ID, Data: data}.Encode())
 		} else {
 			old, derr := txn.DecodeVersion(cur)
@@ -112,7 +143,11 @@ func (in *Insert) Next() (*Row, error) {
 			if !old.Deleted {
 				return nil, fmt.Errorf("duplicate entry '%s' for key 'PRIMARY'", vals[in.table.PK])
 			}
-			undo := tx.AddUndo(txn.UndoUpdate, in.table.Name, tree, key, cur, data)
+			adds, aerr := addIndexEntries(in.table, key, nil, vals)
+			undo := tx.AddUndo(txn.UndoUpdate, in.table.Name, tree, key, cur, data, adds...)
+			if aerr != nil {
+				return nil, aerr
+			}
 			err = tree.Put(key, txn.RowVersion{TxnID: tx.ID, RollPtr: undo, Data: data}.Encode())
 		}
 		if err != nil {
@@ -169,7 +204,11 @@ func (u *Update) Next() (*Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		undo := tx.AddUndo(txn.UndoUpdate, u.table.Name, tree, row.Key, row.Raw, data)
+		adds, aerr := addIndexEntries(u.table, row.Key, row.Values, next)
+		undo := tx.AddUndo(txn.UndoUpdate, u.table.Name, tree, row.Key, row.Raw, data, adds...)
+		if aerr != nil {
+			return nil, aerr
+		}
 		if err := tree.Put(row.Key, txn.RowVersion{TxnID: tx.ID, RollPtr: undo, Data: data}.Encode()); err != nil {
 			return nil, err
 		}

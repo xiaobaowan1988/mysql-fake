@@ -10,6 +10,7 @@ import (
 	"mysqlfake/binlog"
 	"mysqlfake/buffer"
 	"mysqlfake/catalog"
+	"mysqlfake/metrics"
 	"mysqlfake/optimizer"
 	"mysqlfake/stats"
 	"mysqlfake/storage"
@@ -37,9 +38,13 @@ type Options struct {
 	StatsInterval   time.Duration     // 统计信息后台采样间隔，0 表示默认 30s，负数表示关闭
 	StatsSampleSize int               // 每表蓄水池采样行数，默认 10000
 	Planner         optimizer.Options // 优化器选项 (测试用: 强制 Join 算法等)
+
+	SlowQueryThreshold time.Duration // 超过该耗时的语句写入慢查询日志；0 表示关闭
+	SlowQueryLog       string        // 慢查询日志文件路径，空表示 stderr
 }
 
 type Engine struct {
+	path      string // 数据文件路径
 	disk      *storage.DiskManager
 	log       *wal.LogManager
 	pool      *buffer.Pool
@@ -48,6 +53,7 @@ type Engine struct {
 	def       *Session
 	defMu     sync.Mutex
 	bl        *binlog.Log
+	slow      *slowLog
 	stopCkpt  func()
 	stats     *stats.Store
 	statsOpt  Options
@@ -55,6 +61,13 @@ type Engine struct {
 
 	guardMu sync.RWMutex
 	guard   func() error
+
+	backupMu   sync.Mutex // 同一时刻只做一个备份
+	backupHook func(stage string)
+
+	ddlMu   sync.Mutex // 串行化在线 DDL
+	ddlMu2  sync.Mutex // 保护 ddlHook
+	ddlHook func(stage string)
 }
 
 // SetWriteGuard 设置写入守卫: 每条写语句执行前调用，返回错误则拒绝 (集群中用于只读副本)。
@@ -117,7 +130,7 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 	if err := pool.Checkpoint(); err != nil {
 		return fail(err)
 	}
-	e := &Engine{disk: d, log: lm, pool: pool, cat: cat, mgr: txn.NewManager(d, pool)}
+	e := &Engine{path: path, disk: d, log: lm, pool: pool, cat: cat, mgr: txn.NewManager(d, pool)}
 	if !opts.NoBinlog {
 		if e.bl, err = binlog.Open(path + ".binlog"); err != nil {
 			return fail(err)
@@ -125,6 +138,10 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 		e.mgr.Binlog = e.bl
 	}
 	e.def = e.NewSession()
+	if e.slow, err = openSlowLog(opts.SlowQueryThreshold, opts.SlowQueryLog); err != nil {
+		return fail(err)
+	}
+	e.registerGauges()
 	e.stats = stats.NewStore()
 	e.statsOpt = opts
 	e.mgr.Subscribe(func(rec *binlog.Txn) { // 统计修改计数: 触发后台重新采样
@@ -157,6 +174,7 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 // Close 做 Checkpoint 后关闭所有文件。
 func (e *Engine) Close() error {
 	e.def.Close()
+	e.slow.close()
 	if e.stopStats != nil {
 		e.stopStats()
 	}
@@ -255,4 +273,16 @@ func (r *Result) Format() string {
 	}
 	sb.WriteString(r.Summary() + "\n")
 	return sb.String()
+}
+
+// registerGauges 登记抓取时才求值的仪表 (多个引擎实例时以最近打开的为准)。
+func (e *Engine) registerGauges() {
+	metrics.Default.GaugeFunc("mysqlfake_buffer_pool_dirty_pages", "Dirty pages currently in the buffer pool.",
+		func() float64 { return float64(e.pool.DirtyCount()) })
+	metrics.Default.GaugeFunc("mysqlfake_active_transactions", "Open transactions.",
+		func() float64 { return float64(e.mgr.ActiveCount()) })
+	metrics.Default.GaugeFunc("mysqlfake_wal_size_bytes", "Current size of the write-ahead log file.",
+		func() float64 { return float64(e.log.Size()) })
+	metrics.Default.GaugeFunc("mysqlfake_database_pages", "Pages in the database file.",
+		func() float64 { return float64(e.disk.NumPages()) })
 }

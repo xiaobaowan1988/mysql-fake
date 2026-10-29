@@ -36,9 +36,11 @@ type StatsProvider interface {
 }
 
 type Options struct {
-	ForceJoin string // "" | "nl" | "hash" | "merge": 强制 Join 算法 (测试/提示用)
-	NoReorder bool   // 保持 FROM 的顺序 (左深)
-	RowMode   bool   // 使用行式执行器 (默认使用向量化执行器)
+	ForceJoin  string // "" | "nl" | "hash" | "merge": 强制 Join 算法 (测试/提示用)
+	NoReorder  bool   // 保持 FROM 的顺序 (左深)
+	RowMode    bool   // 使用行式执行器 (默认使用向量化执行器)
+	NoIndex    bool   // 不使用二级索引 (测试对拍用)
+	Instrument bool   // 给每个算子加上行数/耗时统计 (EXPLAIN ANALYZE)
 }
 
 type Planner struct {
@@ -60,6 +62,7 @@ type pred struct {
 }
 
 type query struct {
+	ctx    *executor.Ctx
 	pl     *Planner
 	st     *sql.SelectStmt
 	rels   []*rel
@@ -77,7 +80,7 @@ type query struct {
 
 // PlanSelect 为 SELECT 生成最优计划并构建执行器。
 func (pl *Planner) PlanSelect(ctx *executor.Ctx, st *sql.SelectStmt) (*Plan, error) {
-	q := &query{pl: pl, st: st, byName: map[string]int{}, cardMemo: map[uint32]float64{}}
+	q := &query{ctx: ctx, pl: pl, st: st, byName: map[string]int{}, cardMemo: map[uint32]float64{}}
 	if len(st.From) == 0 || len(st.From) > 30 {
 		return nil, fmt.Errorf("unsupported FROM clause")
 	}
@@ -415,45 +418,85 @@ func (q *query) scanNode(ri int) *Node {
 	if len(q.local[ri]) > 0 {
 		n.Detail += " filter: " + joinExprs(q.local[ri])
 	}
-	// 主键范围
 	where := andOf(q.local[ri])
 	if where == nil {
 		return n
 	}
+	best := n
+	// 主键范围 (聚簇索引)
 	pkName := r.ti.Schema.Columns[r.ti.PK].Name
 	start, end, ok := executor.PKRange(where, r.ti, func(c *sql.ColumnRef) bool {
 		id, err := q.resolve(c)
 		return err == nil && id.rel == ri && strings.EqualFold(c.Name, pkName)
 	})
-	if !ok {
-		return n
-	}
-	sel := 1.0
-	for _, c := range q.local[ri] {
-		if q.onlyPK(c, ri) {
-			sel *= q.selectivity(c, ri)
+	if ok {
+		sel := 1.0
+		for _, c := range q.local[ri] {
+			if q.onlyCol(c, ri, r.ti.PK) {
+				sel *= q.selectivity(c, ri)
+			}
+		}
+		idxRows := math.Max(1, r.rows*sel)
+		height := math.Max(1, math.Ceil(math.Log(pages+1)/math.Log(200))+1)
+		cost := height*ioCost + math.Ceil(idxRows/rowsPerPage)*ioCost + idxRows*(cpuTuple+nf*cpuOp)
+		if cost < best.Cost {
+			best = &Node{
+				Op: "IndexScan", rel: r, cols: cols, order: &pk, start: start, end: end, filters: q.local[ri],
+				Rows: q.fRows[ri], Cost: cost,
+				Detail: describeRel(r) + " pk-range " + describeRange(r, start, end) + " filter: " + joinExprs(q.local[ri]),
+			}
 		}
 	}
-	idxRows := math.Max(1, r.rows*sel)
-	height := math.Max(1, math.Ceil(math.Log(pages+1)/math.Log(200))+1)
-	cost := height*ioCost + math.Ceil(idxRows/rowsPerPage)*ioCost + idxRows*(cpuTuple+nf*cpuOp)
-	if cost < n.Cost {
-		return &Node{
-			Op: "IndexScan", rel: r, cols: cols, order: &pk, start: start, end: end, filters: q.local[ri],
-			Rows: q.fRows[ri], Cost: cost,
-			Detail: describeRel(r) + " pk-range " + describeRange(r, start, end) + " filter: " + joinExprs(q.local[ri]),
+	// 二级索引: 范围内每个索引项要回表一次 (随机读)
+	if !q.pl.Opts.NoIndex {
+		for _, ix := range r.ti.Indexes {
+			if !q.indexUsable(ix) {
+				continue
+			}
+			colName := r.ti.Schema.Columns[ix.Column].Name
+			s, e, ok := executor.IndexRange(where, r.ti, ix, func(c *sql.ColumnRef) bool {
+				id, err := q.resolve(c)
+				return err == nil && id.rel == ri && strings.EqualFold(c.Name, colName)
+			})
+			if !ok {
+				continue
+			}
+			sel := 1.0
+			for _, c := range q.local[ri] {
+				if q.onlyCol(c, ri, ix.Column) {
+					sel *= q.selectivity(c, ri)
+				}
+			}
+			idxRows := math.Max(1, r.rows*sel)
+			height := math.Max(1, math.Ceil(math.Log(r.rows/100+1)/math.Log(200))+1)
+			cost := height*ioCost + math.Ceil(idxRows/200)*ioCost + idxRows*(0.5*ioCost+cpuTuple+nf*cpuOp)
+			if cost < best.Cost {
+				best = &Node{
+					Op: "IndexScan", rel: r, cols: cols, idx: ix, start: s, end: e, filters: q.local[ri],
+					Rows: q.fRows[ri], Cost: cost,
+					Detail: describeRel(r) + " index " + ix.Name + "(" + colName + ") filter: " + joinExprs(q.local[ri]),
+				}
+			}
 		}
 	}
-	return n
+	return best
 }
 
-func (q *query) onlyPK(e sql.Expr, ri int) bool {
+// indexUsable: 只有在索引创建 (切换) 之后建立的 Read View 才能用它做快照读。
+func (q *query) indexUsable(ix *catalog.IndexInfo) bool {
+	if q.ctx == nil || q.ctx.Txn == nil {
+		return true
+	}
+	return q.ctx.Txn.View().UpLimit > ix.ValidFrom
+}
+
+func (q *query) onlyCol(e sql.Expr, ri, col int) bool {
 	ok := true
 	var walk func(e sql.Expr)
 	walk = func(e sql.Expr) {
 		switch e := e.(type) {
 		case *sql.ColumnRef:
-			if id, err := q.resolve(e); err != nil || id.rel != ri || !q.isPK(id) {
+			if id, err := q.resolve(e); err != nil || id.rel != ri || id.col != col {
 				ok = false
 			}
 		case *sql.BinaryExpr:
@@ -822,6 +865,15 @@ func (q *query) typesOf(cols []colID) []tuple.Type {
 // buildVec 构建向量化执行器: 扫描/过滤/哈希连接/LIMIT/投影原生向量化，其余算子 (嵌套循环、归并连接、排序)
 // 用行式实现并通过适配器接入。
 func (q *query) buildVec(ctx *executor.Ctx, n *Node) (vector.BatchExecutor, error) {
+	v, err := q.buildVecInner(ctx, n)
+	if err == nil && q.pl.Opts.Instrument {
+		n.actual = &executor.OpStats{}
+		v = vector.NewInstrumented(v, n.actual)
+	}
+	return v, err
+}
+
+func (q *query) buildVecInner(ctx *executor.Ctx, n *Node) (vector.BatchExecutor, error) {
 	filter := func(child vector.BatchExecutor, es []sql.Expr, cols []colID) (vector.BatchExecutor, error) {
 		if len(es) == 0 {
 			return child, nil
@@ -834,6 +886,9 @@ func (q *query) buildVec(ctx *executor.Ctx, n *Node) (vector.BatchExecutor, erro
 	}
 	switch n.Op {
 	case "SeqScan", "IndexScan":
+		if n.idx != nil { // 二级索引扫描走行式实现 (回表为随机读)，经适配器接入
+			break
+		}
 		var start, end []byte
 		if n.Op == "IndexScan" {
 			start, end = n.start, n.end
@@ -888,12 +943,24 @@ func (q *query) buildVec(ctx *executor.Ctx, n *Node) (vector.BatchExecutor, erro
 }
 
 func (q *query) buildRow(ctx *executor.Ctx, n *Node) (executor.Executor, error) {
+	ex, err := q.buildRowInner(ctx, n)
+	if err == nil && q.pl.Opts.Instrument {
+		n.actual = &executor.OpStats{}
+		ex = executor.NewInstrumented(ex, n.actual)
+	}
+	return ex, err
+}
+
+func (q *query) buildRowInner(ctx *executor.Ctx, n *Node) (executor.Executor, error) {
 	switch n.Op {
 	case "SeqScan", "IndexScan":
 		var scan executor.Executor
-		if n.Op == "SeqScan" {
+		switch {
+		case n.Op == "SeqScan":
 			scan = executor.NewSeqScan(ctx, n.rel.ti)
-		} else {
+		case n.idx != nil:
+			scan = executor.NewSecondaryIndexScan(ctx, n.rel.ti, n.idx, n.start, n.end)
+		default:
 			scan = executor.NewIndexScan(ctx, n.rel.ti, n.start, n.end)
 		}
 		pred, err := q.bindAll(n.filters, n.cols)

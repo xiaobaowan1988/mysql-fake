@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 // 文件头页 (页 0) 布局:
@@ -285,4 +286,27 @@ func (d *DiskManager) ReadPageRaw(id PageID, p *Page) error {
 		return fmt.Errorf("%w: page %d", ErrChecksum, id) // 数据仍已读入 p，由调用方决定如何处理
 	}
 	return nil
+}
+
+// ReadPageConsistent 供热备份使用: 页可能正被并发写入 (读到撕裂的内容)，校验和失败时重读几次。
+func (d *DiskManager) ReadPageConsistent(id PageID, p *Page) error {
+	var err error
+	for i := 0; i < 20; i++ {
+		if err = d.ReadPageRaw(id, p); err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrChecksum) {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return err
+}
+
+// ReadHeader 读取文件头页 (页 0) 的原始内容。
+func (d *DiskManager) ReadHeader(buf *[PageSize]byte) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, err := d.f.ReadAt(buf[:], 0)
+	return err
 }

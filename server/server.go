@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"mysqlfake/db"
+	"mysqlfake/metrics"
 )
 
 // Mode 选择网络 I/O 模型。
@@ -75,6 +76,9 @@ var ErrEventLoopUnsupported = errors.New("server: event loop (epoll/kqueue) is n
 // Start 绑定地址并在后台开始服务。
 func (s *Server) Start() error {
 	s.pool = NewWorkerPool(s.cfg.MinWorkers, s.cfg.MaxWorkers, s.cfg.WorkerIdle)
+	metrics.Default.GaugeFunc("mysqlfake_connections", "Currently open client connections.", func() float64 { return float64(s.nconns.Load()) })
+	metrics.Default.GaugeFunc("mysqlfake_worker_pool_workers", "Worker goroutines currently alive in the statement worker pool.", func() float64 { return float64(s.pool.Stats().Workers) })
+	metrics.Default.GaugeFunc("mysqlfake_worker_pool_queued", "Requests waiting for a worker.", func() float64 { return float64(s.pool.Stats().Queued) })
 	mode := s.cfg.Mode
 	if mode == ModeAuto {
 		mode = ModeGoroutine
@@ -126,6 +130,7 @@ func (s *Server) track(pc *protoConn) {
 	s.mu.Unlock()
 	s.nconns.Add(1)
 	s.accepted.Add(1)
+	metrics.ConnAccepted.Inc()
 }
 
 // releaseConn 在连接结束后回收: 回滚会话中未提交的事务并更新计数。

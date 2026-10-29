@@ -31,6 +31,7 @@ var keywords = map[string]bool{
 	"TRANSACTION": true, "COMMIT": true, "ROLLBACK": true,
 	"JOIN": true, "INNER": true, "ON": true, "AS": true, "ORDER": true, "BY": true, "LIMIT": true,
 	"ASC": true, "DESC": true, "EXPLAIN": true, "ANALYZE": true,
+	"INDEX": true, "ALTER": true, "BACKUP": true, "TO": true, "INCREMENTAL": true, "ADD": true, "COLUMN": true, "DEFAULT": true,
 }
 
 func lex(src string) ([]token, error) {

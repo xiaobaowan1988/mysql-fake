@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 
+	"mysqlfake/metrics"
 	"mysqlfake/storage"
 )
 
@@ -203,11 +204,13 @@ func (lm *LogManager) flushLocked() error {
 		if _, err := lm.f.WriteAt(lm.buf, st.Size()); err != nil {
 			return err
 		}
+		metrics.WALBytes.Add(uint64(len(lm.buf)))
 		lm.buf = lm.buf[:0]
 	}
 	if err := lm.f.Sync(); err != nil {
 		return err
 	}
+	metrics.WALFsyncs.Inc()
 	lm.flushedLSN = lm.nextLSN - 1
 	return nil
 }
@@ -318,3 +321,45 @@ func (lm *LogManager) Close() error {
 
 // CloseNoFlush 丢弃内存缓冲并关闭文件 (模拟崩溃，仅测试使用)。
 func (lm *LogManager) CloseNoFlush() error { return lm.f.Close() }
+
+// ReadFile 以只读方式解析一个 WAL 文件 (不修改它，撕裂的尾部被忽略)，返回有效记录。
+func ReadFile(path string) ([]Record, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < logHeaderSize || string(data[:8]) != logMagic {
+		return nil, ErrBadLog
+	}
+	var recs []Record
+	pos := logHeaderSize
+	for pos+8 <= len(data) {
+		bl := int(binary.LittleEndian.Uint32(data[pos:]))
+		if pos+8+bl > len(data) {
+			break
+		}
+		body := data[pos+8 : pos+8+bl]
+		if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(data[pos+4:]) {
+			break
+		}
+		r, ok := decodeBody(body)
+		if !ok {
+			break
+		}
+		recs = append(recs, r)
+		pos += 8 + bl
+	}
+	return recs, nil
+}
+
+// WriteFile 把记录写成一个新的 WAL 文件 (LSN 必须已经分配好)；nextLSN 是下一个要分配的 LSN。
+func WriteFile(path string, recs []Record, nextLSN uint64) error {
+	var h [logHeaderSize]byte
+	copy(h[:8], logMagic)
+	binary.LittleEndian.PutUint64(h[8:], nextLSN)
+	buf := h[:]
+	for i := range recs {
+		buf = append(buf, recs[i].encode()...)
+	}
+	return os.WriteFile(path, buf, 0o644)
+}

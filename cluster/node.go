@@ -15,6 +15,7 @@ import (
 
 	"mysqlfake/binlog"
 	"mysqlfake/db"
+	"mysqlfake/metrics"
 	"mysqlfake/raft"
 )
 
@@ -107,6 +108,7 @@ func Open(opts Options) (*Node, error) {
 		eng.Close()
 		return nil, err
 	}
+	n.registerGauges()
 	eng.SetWriteGuard(n.writeGuard)
 	eng.SetReplicator(n.replicate)
 	n.wg.Add(1)
@@ -308,4 +310,27 @@ func (n *Node) Close() error {
 	n.rf.Stop()
 	n.wg.Wait()
 	return n.eng.Close()
+}
+
+func (n *Node) registerGauges() {
+	g := metrics.Default.GaugeFunc
+	g("mysqlfake_raft_term", "Current Raft term.", func() float64 { return float64(n.rf.Status().Term) })
+	g("mysqlfake_raft_is_leader", "1 if this node is the leader with a valid lease.", func() float64 {
+		if n.rf.IsLeader() {
+			return 1
+		}
+		return 0
+	})
+	g("mysqlfake_raft_commit_index", "Raft commit index.", func() float64 { return float64(n.rf.Status().CommitIndex) })
+	g("mysqlfake_raft_last_index", "Last Raft log index.", func() float64 { return float64(n.rf.Status().LastIndex) })
+	g("mysqlfake_raft_applied_index", "Last Raft log index applied to the local database.", func() float64 { return float64(n.AppliedIndex()) })
+	g("mysqlfake_replication_lag_entries", "Committed entries not yet applied locally.", func() float64 {
+		return float64(n.rf.Status().CommitIndex) - float64(n.AppliedIndex())
+	})
+	g("mysqlfake_node_diverged", "1 if this node lost locally committed transactions and must be resynced.", func() float64 {
+		if n.Diverged() {
+			return 1
+		}
+		return 0
+	})
 }

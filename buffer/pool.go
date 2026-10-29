@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"mysqlfake/metrics"
 	"mysqlfake/storage"
 	"mysqlfake/wal"
 )
@@ -78,8 +79,10 @@ func (p *Pool) FetchPage(id storage.PageID) (*Frame, error) {
 func (p *Pool) fetchLocked(id storage.PageID) (*Frame, error) {
 	if f, ok := p.table[id]; ok {
 		p.pinLocked(f)
+		metrics.BufferHits.Inc()
 		return f, nil
 	}
+	metrics.BufferMisses.Inc()
 	f, err := p.victimLocked()
 	if err != nil {
 		return nil, err
@@ -142,6 +145,7 @@ func (p *Pool) victimLocked() (*Frame, error) {
 	id := p.frames[f]
 	delete(p.table, id)
 	delete(p.frames, f)
+	metrics.BufferEvictions.Inc()
 	return f, nil
 }
 
@@ -464,6 +468,7 @@ func (p *Pool) FuzzyCheckpoint() (uint64, error) {
 	hold := p.hold > 0
 	p.cpCount++
 	p.mu.Unlock()
+	metrics.Checkpoints.Inc()
 	if !hold {
 		if _, err := p.log.TruncateBefore(ckpt); err != nil {
 			return 0, err

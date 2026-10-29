@@ -465,3 +465,12 @@ func (s *Store) NeedsAnalyze(table string) bool {
 	threshold := math.Max(50, ts.Rows*0.1)
 	return float64(s.mods[k]) > threshold
 }
+
+// Invalidate 丢弃表的统计信息 (表结构变化后使用)。
+func (s *Store) Invalidate(table string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := strings.ToLower(table)
+	delete(s.tables, k)
+	delete(s.mods, k)
+}

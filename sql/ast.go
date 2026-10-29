@@ -1,7 +1,11 @@
 // Package sql 提供词法分析、语法解析及 AST 定义。
 package sql
 
-import "mysqlfake/tuple"
+import (
+	"fmt"
+
+	"mysqlfake/tuple"
+)
 
 type Statement interface{ stmt() }
 
@@ -62,8 +66,43 @@ type SelectStmt struct {
 	Lock    LockClause
 }
 
+// CreateIndexStmt: CREATE INDEX name ON table (column)
+type CreateIndexStmt struct{ Name, Table, Column string }
+
+func (s *CreateIndexStmt) String() string {
+	return "CREATE INDEX " + s.Name + " ON " + s.Table + " (" + s.Column + ")"
+}
+
+// AlterTableStmt: ALTER TABLE t ADD COLUMN c type [DEFAULT literal]
+type AlterTableStmt struct {
+	Table   string
+	Add     ColumnDef
+	Default *Literal // 可为 nil (等价于 DEFAULT NULL)
+}
+
+func (s *AlterTableStmt) String() string {
+	t := "INT"
+	if s.Add.Type == 2 {
+		t = fmt.Sprintf("VARCHAR(%d)", s.Add.Len)
+	}
+	out := "ALTER TABLE " + s.Table + " ADD COLUMN " + s.Add.Name + " " + t
+	if s.Default != nil {
+		out += " DEFAULT " + ExprString(s.Default)
+	}
+	return out
+}
+
+// BackupStmt: BACKUP TO 'dir' [INCREMENTAL FROM 'base']
+type BackupStmt struct {
+	Dir  string
+	From string // 非空表示增量备份，值为上一份备份的目录
+}
+
 // ExplainStmt 显示查询的执行计划。
-type ExplainStmt struct{ Select *SelectStmt }
+type ExplainStmt struct {
+	Select  *SelectStmt
+	Analyze bool // EXPLAIN ANALYZE: 实际执行并给出逐算子的实际行数与耗时
+}
 
 // AnalyzeStmt 重新收集表的统计信息。
 type AnalyzeStmt struct{ Table string }
@@ -95,6 +134,9 @@ func (*InsertStmt) stmt()      {}
 func (*SelectStmt) stmt()      {}
 func (*ShowTablesStmt) stmt()  {}
 func (*ExplainStmt) stmt()     {}
+func (*CreateIndexStmt) stmt() {}
+func (*BackupStmt) stmt()      {}
+func (*AlterTableStmt) stmt()  {}
 func (*AnalyzeStmt) stmt()     {}
 func (*UpdateStmt) stmt()      {}
 func (*DeleteStmt) stmt()      {}

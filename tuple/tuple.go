@@ -354,3 +354,103 @@ func UnmarshalColumns(s *Schema, b []byte, cols []ColBuf) error {
 	}
 	return nil
 }
+
+// ---- 二级索引键编码 ----
+//
+// 索引键 = 列值的保序前缀编码 + 主键编码。
+// INT 前缀是 8 字节 (符号位翻转的大端)；VARCHAR 前缀把 0x00 转义为 0x00 0xFF，并以 0x00 0x01 结尾，
+// 因此前缀之间没有包含关系，且字节序与值的比较序一致。
+
+// EncodeIndexPrefix 编码索引列的值 (不含主键)。NULL 不入索引。
+func EncodeIndexPrefix(v Value) ([]byte, error) {
+	if v.Null {
+		return nil, errors.New("tuple: NULL is not indexed")
+	}
+	switch v.Type {
+	case TypeInt:
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(v.Int)^(1<<63))
+		return b[:], nil
+	case TypeVarchar:
+		b := make([]byte, 0, len(v.Str)+2)
+		for i := 0; i < len(v.Str); i++ {
+			if v.Str[i] == 0 {
+				b = append(b, 0, 0xFF)
+			} else {
+				b = append(b, v.Str[i])
+			}
+		}
+		return append(b, 0, 1), nil
+	}
+	return nil, errors.New("tuple: bad index column type")
+}
+
+// IndexKey 生成完整的索引键 (前缀 + 主键)。
+func IndexKey(v Value, pk []byte) ([]byte, error) {
+	p, err := EncodeIndexPrefix(v)
+	if err != nil {
+		return nil, err
+	}
+	return append(p, pk...), nil
+}
+
+// SplitIndexKey 把索引键拆回 (列值前缀, 主键)。
+func SplitIndexKey(t Type, key []byte) (prefix, pk []byte, err error) {
+	switch t {
+	case TypeInt:
+		if len(key) < 8 {
+			return nil, nil, ErrCorrupt
+		}
+		return key[:8], key[8:], nil
+	case TypeVarchar:
+		for i := 0; i+1 < len(key); i++ {
+			if key[i] == 0 {
+				if key[i+1] == 1 {
+					return key[:i+2], key[i+2:], nil
+				}
+				i++ // 转义序列 00 FF
+			}
+		}
+	}
+	return nil, nil, ErrCorrupt
+}
+
+// DecodeIndexPrefix 把前缀解码回列值。
+func DecodeIndexPrefix(t Type, p []byte) (Value, error) {
+	switch t {
+	case TypeInt:
+		if len(p) != 8 {
+			return Value{}, ErrCorrupt
+		}
+		return IntValue(int64(binary.BigEndian.Uint64(p) ^ (1 << 63))), nil
+	case TypeVarchar:
+		if len(p) < 2 {
+			return Value{}, ErrCorrupt
+		}
+		return StrValue(string(unescapeVarchar(p[:len(p)-2]))), nil
+	}
+	return Value{}, ErrCorrupt
+}
+
+func unescapeVarchar(p []byte) []byte {
+	out := make([]byte, 0, len(p))
+	for i := 0; i < len(p); i++ {
+		out = append(out, p[i])
+		if p[i] == 0 && i+1 < len(p) {
+			i++ // 跳过转义字节 FF
+		}
+	}
+	return out
+}
+
+// PrefixEnd 返回大于所有以 p 为前缀的键的最小字节串；p 全为 0xFF 时返回 nil (无上界)。
+func PrefixEnd(p []byte) []byte {
+	out := bytes.Clone(p)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] < 0xFF {
+			out[i]++
+			return out[:i+1]
+		}
+	}
+	return nil
+}

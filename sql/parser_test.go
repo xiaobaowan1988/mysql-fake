@@ -180,3 +180,41 @@ func TestStringEscapes(t *testing.T) {
 		t.Error("escaped closing quote must leave the string unterminated")
 	}
 }
+
+func TestParseDDL(t *testing.T) {
+	st, err := Parse("create index idx_a on users (age);")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci := st.(*CreateIndexStmt)
+	if ci.Name != "idx_a" || ci.Table != "users" || ci.Column != "age" || ci.String() != "CREATE INDEX idx_a ON users (age)" {
+		t.Fatalf("%+v", ci)
+	}
+	st, err = Parse("ALTER TABLE t ADD COLUMN name VARCHAR(12) DEFAULT 'x'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := st.(*AlterTableStmt)
+	if at.Table != "t" || at.Add.Name != "name" || at.Add.Len != 12 || at.Default.Value.Str != "x" ||
+		at.String() != "ALTER TABLE t ADD COLUMN name VARCHAR(12) DEFAULT 'x'" {
+		t.Fatalf("%+v %s", at, at.String())
+	}
+	st, _ = Parse("ALTER TABLE t ADD c INT")
+	if st.(*AlterTableStmt).Default != nil || st.(*AlterTableStmt).String() != "ALTER TABLE t ADD COLUMN c INT" {
+		t.Fatal("no default")
+	}
+	// 规范化后的文本可以再次解析 (复制/回放依赖这一点)
+	again, err := Parse(st.(*AlterTableStmt).String())
+	if err != nil || again.(*AlterTableStmt).Add.Name != "c" {
+		t.Fatal("canonical text must parse")
+	}
+	st, err = Parse("explain analyze select * from t")
+	if err != nil || !st.(*ExplainStmt).Analyze {
+		t.Fatal("explain analyze", err)
+	}
+	for _, bad := range []string{"CREATE INDEX ON t (a)", "CREATE INDEX i ON t a", "ALTER TABLE t DROP COLUMN a", "ALTER TABLE t ADD COLUMN a INT PRIMARY KEY", "ALTER t ADD a INT", "ALTER TABLE t ADD a INT DEFAULT b"} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("expected error for %q", bad)
+		}
+	}
+}

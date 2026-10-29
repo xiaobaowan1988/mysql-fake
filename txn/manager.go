@@ -3,11 +3,14 @@ package txn
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mysqlfake/binlog"
 	"mysqlfake/btree"
+	"mysqlfake/metrics"
 )
 
 var ErrTxnFinished = errors.New("txn: transaction already finished")
@@ -39,8 +42,13 @@ type Manager struct {
 	// 提交钩子 (按顺序): 复制 -> 本地 Binlog -> 订阅者。
 	Binlog     *binlog.Log
 	replicator ReplicateFunc
-	subs       map[int]func(*binlog.Txn)
-	nextSub    int
+
+	// 写入静默 (热备份用): quiescing 为真时，事务第一次写入会阻塞；writers 是已经写过数据、尚未结束的事务数
+	quiescing bool
+	writers   int
+	gate      *sync.Cond
+	subs      map[int]func(*binlog.Txn)
+	nextSub   int
 }
 
 // ReplicateFunc 在事务提交前把事务的行事件复制出去 (Raft 等)。返回错误则事务回滚。
@@ -76,13 +84,63 @@ func NewManager(store IDStore, log Logger) *Manager {
 	if base == 0 {
 		base = 1
 	}
-	return &Manager{
+	m := &Manager{
 		store: store, log: log,
 		next: base, reserved: base,
 		active: map[uint64]*Txn{},
 		Locks:  NewLockManager(),
 		Undo:   NewUndoLog(),
 	}
+	m.gate = sync.NewCond(&m.mu)
+	return m
+}
+
+// noteWrite 在事务第一次写入时登记；写入静默期间在这里排队。
+func (t *Txn) noteWrite() {
+	if t.wrote {
+		return
+	}
+	m := t.mgr
+	m.mu.Lock()
+	for m.quiescing {
+		m.gate.Wait()
+	}
+	m.writers++
+	m.mu.Unlock()
+	t.wrote = true
+}
+
+var ErrQuiesceTimeout = errors.New("txn: timed out waiting for open write transactions to finish")
+
+// Quiesce 暂停写入: 新的写入排队，并等待已经写过数据的事务全部结束 (提交或回滚)。
+// 返回后日志里不再有未结束事务的修改。release 恢复写入。
+func (m *Manager) Quiesce(timeout time.Duration) (release func(), err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.quiescing {
+		return nil, errors.New("txn: already quiesced")
+	}
+	m.quiescing = true
+	deadline := time.Now().Add(timeout)
+	timer := time.AfterFunc(timeout, func() { m.mu.Lock(); m.gate.Broadcast(); m.mu.Unlock() })
+	defer timer.Stop()
+	for m.writers > 0 {
+		if time.Now().After(deadline) {
+			m.quiescing = false
+			m.gate.Broadcast()
+			return nil, ErrQuiesceTimeout
+		}
+		m.gate.Wait()
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			m.quiescing = false
+			m.gate.Broadcast()
+			m.mu.Unlock()
+		})
+	}, nil
 }
 
 type Txn struct {
@@ -92,6 +150,8 @@ type Txn struct {
 	evs             []binlog.Event // 与 undo 一一对应的行事件
 	ddl             []binlog.Event // DDL 事件 (自动提交，不参与回滚)
 	fromReplication bool           // 由复制日志应用产生，不再向外复制
+	onCommit        func() error
+	lockWait        atomic.Int64 // 本事务累计的锁等待时间 (纳秒)   // 提交 (复制、日志落盘) 成功之后、释放锁之前执行
 	view            *ReadView
 	wrote           bool
 	done            bool
@@ -145,16 +205,30 @@ func (t *Txn) Lock(res string, mode LockMode) error {
 	if t.done {
 		return ErrTxnFinished
 	}
-	return t.mgr.Locks.Lock(t.ID, res, mode)
+	if mode == LockX {
+		// 要拿排他锁就是要写: 在拿锁之前就登记 (热备份的写入静默在此排队)，
+		// 避免"已持有行锁的事务在静默处排队、静默却在等待被它挡住的写事务"的死锁
+		t.noteWrite()
+	}
+	d, err := t.mgr.Locks.LockTimed(t.ID, res, mode)
+	if d > 0 {
+		t.lockWait.Add(int64(d))
+	}
+	return err
 }
+
+// LockWaitTime 返回本事务累计的锁等待时间。
+func (t *Txn) LockWaitTime() time.Duration { return time.Duration(t.lockWait.Load()) }
 
 // AddUndo 在修改前记录 undo，返回新版本应写入的 Rollback_Pointer。
 // newRow 是修改后的行数据 (UndoDelete 传 nil)，用于生成对应的 Binlog 行事件。
-func (t *Txn) AddUndo(kind UndoKind, table string, tree *btree.Tree, key, oldValue, newRow []byte) uint64 {
-	t.wrote = true
+// idxAdds 是这次修改新增的二级索引项 (回滚时会被删除)。
+func (t *Txn) AddUndo(kind UndoKind, table string, tree *btree.Tree, key, oldValue, newRow []byte, idxAdds ...IdxRef) uint64 {
+	t.noteWrite()
 	id := t.mgr.Undo.add(&UndoRecord{
 		TxnID: t.ID, Kind: kind, Table: table, Tree: tree,
 		Key: append([]byte(nil), key...), OldValue: append([]byte(nil), oldValue...),
+		IdxAdds: idxAdds,
 	})
 	t.undo = append(t.undo, id)
 	ev := binlog.Event{Op: binlog.OpPut, Table: table, Key: append([]byte(nil), key...), Row: append([]byte(nil), newRow...)}
@@ -167,7 +241,7 @@ func (t *Txn) AddUndo(kind UndoKind, table string, tree *btree.Tree, key, oldVal
 
 // AddDDLEvent 记录一条 DDL 事件 (随事务提交写入 Binlog 并复制)。
 func (t *Txn) AddDDLEvent(sql string) {
-	t.wrote = true
+	t.noteWrite()
 	t.ddl = append(t.ddl, binlog.Event{Op: binlog.OpDDL, SQL: sql})
 }
 
@@ -194,6 +268,11 @@ func (t *Txn) RollbackTo(sp int) error {
 		}
 		if err != nil {
 			return err
+		}
+		for _, ix := range rec.IdxAdds { // 撤销本次新增的索引项
+			if _, err := ix.Tree.Delete(ix.Key); err != nil {
+				return err
+			}
 		}
 		// undo 记录不在此处删除: 并发读者可能已经取得指向它的版本指针，
 		// 它们会在没有活跃事务时由 purgeIfIdle 统一清理。
@@ -232,9 +311,17 @@ func (t *Txn) Commit() error {
 	if t.wrote {
 		err = t.mgr.log.Commit(t.ID)
 	}
+	if t.onCommit != nil && err == nil {
+		err = t.onCommit()
+	}
+	metrics.TxnCommits.Inc()
 	t.finish()
 	return err
 }
+
+// SetOnCommit 注册一个回调，在事务提交成功 (含复制与日志落盘) 之后、释放锁之前执行。
+// Online DDL 用它在持有元数据锁 X 的情况下完成 Catalog 切换。
+func (t *Txn) SetOnCommit(f func() error) { t.onCommit = f }
 
 func (m *Manager) notify(rec *binlog.Txn) {
 	m.mu.Lock()
@@ -257,6 +344,7 @@ func (t *Txn) Rollback() error {
 	if t.wrote {
 		t.mgr.log.Abort(t.ID)
 	}
+	metrics.TxnRollbacks.Inc()
 	t.finish()
 	return err
 }
@@ -267,6 +355,10 @@ func (t *Txn) finish() {
 	m.mu.Lock()
 	delete(m.active, t.ID)
 	idle := len(m.active) == 0
+	if t.wrote {
+		m.writers--
+		m.gate.Broadcast()
+	}
 	m.mu.Unlock()
 	m.Locks.ReleaseAll(t.ID)
 	if idle {
@@ -319,10 +411,19 @@ func (m *Manager) ActiveCount() int {
 }
 
 // MarkWrote 标记事务有需要持久化的修改 (例如 DDL 直接修改了 Catalog 页)，保证提交时写日志。
-func (t *Txn) MarkWrote() { t.wrote = true }
+func (t *Txn) MarkWrote() { t.noteWrite() }
 
-// NextIDForTest 返回下一个将分配的事务 ID (测试用)。
-func (m *Manager) NextIDForTest() uint64 {
+// LockMDL 对表加元数据锁 (S)，持有到事务结束。写事务必须在读取 TableInfo 之前调用，
+// 这样 Online DDL 切换 (X 锁) 时不会有事务仍在向旧结构写入。
+func (t *Txn) LockMDL(table string) error {
+	return t.Lock(MDLResource(table), LockS)
+}
+
+// MDLResource 返回表的元数据锁资源名。
+func MDLResource(table string) string { return "mdl:" + strings.ToLower(table) }
+
+// NextID 返回下一个将分配的事务号。
+func (m *Manager) NextID() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.next

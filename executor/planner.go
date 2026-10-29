@@ -174,6 +174,7 @@ type scanSpec struct {
 	pred       Expr
 	start, end []byte
 	ranged     bool
+	idx        *catalog.IndexInfo // 非空: start/end 是该二级索引的键范围
 }
 
 func analyzeWhere(where sql.Expr, ti *catalog.TableInfo) (scanSpec, error) {
@@ -188,13 +189,29 @@ func analyzeWhere(where sql.Expr, ti *catalog.TableInfo) (scanSpec, error) {
 	sp.start, sp.end, sp.ranged = PKRange(where, ti, func(c *sql.ColumnRef) bool {
 		return strings.EqualFold(c.Name, ti.Schema.Columns[ti.PK].Name)
 	})
+	if !sp.ranged { // 没有主键范围时尝试二级索引 (当前读的候选行定位)
+		for _, ix := range ti.Indexes {
+			name := ti.Schema.Columns[ix.Column].Name
+			if s, e, ok := IndexRange(where, ti, ix, func(c *sql.ColumnRef) bool { return strings.EqualFold(c.Name, name) }); ok {
+				sp.start, sp.end, sp.ranged, sp.idx = s, e, true, ix
+				break
+			}
+		}
+	}
 	return sp, nil
+}
+
+func (sp scanSpec) lockScan(ctx *Ctx, ti *catalog.TableInfo, mode txn.LockMode) *LockScan {
+	if sp.idx != nil {
+		return NewLockIndexScan(ctx, ti, sp.idx, sp.start, sp.end, sp.pred, mode)
+	}
+	return NewLockScan(ctx, ti, sp.start, sp.end, sp.pred, mode)
 }
 
 // snapshotScan 生成无锁快照读的扫描: IndexScan (WHERE 含主键范围时) 或 SeqScan，再叠加 Filter。
 func snapshotScan(ctx *Ctx, ti *catalog.TableInfo, sp scanSpec) Executor {
 	var scan Executor = NewSeqScan(ctx, ti)
-	if sp.ranged {
+	if sp.ranged && sp.idx == nil {
 		scan = NewIndexScan(ctx, ti, sp.start, sp.end)
 	}
 	if sp.pred != nil {
@@ -234,9 +251,9 @@ func PlanSelect(ctx *Ctx, st *sql.SelectStmt, ti *catalog.TableInfo) (Executor, 
 	var root Executor
 	switch st.Lock {
 	case sql.LockShare:
-		root = NewLockScan(ctx, ti, sp.start, sp.end, sp.pred, txn.LockS)
+		root = sp.lockScan(ctx, ti, txn.LockS)
 	case sql.LockUpdate:
-		root = NewLockScan(ctx, ti, sp.start, sp.end, sp.pred, txn.LockX)
+		root = sp.lockScan(ctx, ti, txn.LockX)
 	default:
 		root = snapshotScan(ctx, ti, sp)
 	}
@@ -272,7 +289,7 @@ func PlanUpdate(ctx *Ctx, st *sql.UpdateStmt, ti *catalog.TableInfo) (*Update, e
 	if err != nil {
 		return nil, err
 	}
-	child := NewLockScan(ctx, ti, sp.start, sp.end, sp.pred, txn.LockX)
+	child := sp.lockScan(ctx, ti, txn.LockX)
 	return &Update{ctx: ctx, table: ti, child: child, sets: sets}, nil
 }
 
@@ -282,7 +299,7 @@ func PlanDelete(ctx *Ctx, st *sql.DeleteStmt, ti *catalog.TableInfo) (*Delete, e
 	if err != nil {
 		return nil, err
 	}
-	child := NewLockScan(ctx, ti, sp.start, sp.end, sp.pred, txn.LockX)
+	child := sp.lockScan(ctx, ti, txn.LockX)
 	return &Delete{ctx: ctx, table: ti, child: child}, nil
 }
 

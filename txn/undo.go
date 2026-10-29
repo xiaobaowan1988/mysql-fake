@@ -24,6 +24,13 @@ type UndoRecord struct {
 	Tree     *btree.Tree
 	Key      []byte
 	OldValue []byte
+	IdxAdds  []IdxRef // 本次修改新增的二级索引项: 回滚时撤销
+}
+
+// IdxRef 指向二级索引树中的一个索引项。
+type IdxRef struct {
+	Tree *btree.Tree
+	Key  []byte
 }
 
 // UndoLog 保存所有 undo 记录 (内存中)，通过自增 ID 寻址；ID 即行上的 Rollback_Pointer。

@@ -235,3 +235,23 @@ func (l *Log) Close() error {
 	defer l.mu.Unlock()
 	return l.f.Close()
 }
+
+// ReadFile 以只读方式读取 Binlog 文件中序号 >= fromSeq 的记录 (不修改文件，撕裂的尾部被忽略)。
+func ReadFile(path string, fromSeq uint64) ([]*Txn, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []*Txn
+	for pos := 0; pos < len(data); {
+		t, n := parseRecord(data[pos:])
+		if t == nil {
+			break
+		}
+		if t.Seq >= fromSeq {
+			out = append(out, t)
+		}
+		pos += n
+	}
+	return out, nil
+}

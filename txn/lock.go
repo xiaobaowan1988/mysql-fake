@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"mysqlfake/metrics"
 )
 
 type LockMode uint8
@@ -50,6 +52,12 @@ func compatible(a, b LockMode) bool { return a == LockS && b == LockS }
 
 // Lock 为事务获取资源上的锁，必要时阻塞。
 func (lm *LockManager) Lock(txn uint64, res string, mode LockMode) error {
+	_, err := lm.LockTimed(txn, res, mode)
+	return err
+}
+
+// LockTimed 与 Lock 相同，并返回因等待而阻塞的时间 (没有等待则为 0)。
+func (lm *LockManager) LockTimed(txn uint64, res string, mode LockMode) (time.Duration, error) {
 	lm.mu.Lock()
 	q := lm.queues[res]
 	if q == nil {
@@ -66,12 +74,12 @@ func (lm *LockManager) Lock(txn uint64, res string, mode LockMode) error {
 	switch {
 	case mine != nil && (mine.mode == LockX || mode == LockS):
 		lm.mu.Unlock()
-		return nil // 已持有足够强的锁
+		return 0, nil // 已持有足够强的锁
 	case mine != nil: // S -> X 升级
 		if lm.onlyHolder(q, txn) {
 			mine.mode = LockX
 			lm.mu.Unlock()
-			return nil
+			return 0, nil
 		}
 		req = &lockReq{txn: txn, mode: LockX, upgrade: true, ch: make(chan struct{})}
 		// 升级请求排在所有已授予请求之后、普通等待者之前
@@ -89,7 +97,7 @@ func (lm *LockManager) Lock(txn uint64, res string, mode LockMode) error {
 			q.reqs = append(q.reqs, req)
 			lm.track(txn, res)
 			lm.mu.Unlock()
-			return nil
+			return 0, nil
 		}
 		q.reqs = append(q.reqs, req)
 	}
@@ -98,29 +106,38 @@ func (lm *LockManager) Lock(txn uint64, res string, mode LockMode) error {
 		lm.removeReq(q, req)
 		lm.gc(res, q)
 		lm.mu.Unlock()
-		return ErrDeadlock
+		metrics.Deadlocks.Inc()
+		return 0, ErrDeadlock
 	}
 	timeout := lm.Timeout
 	lm.mu.Unlock()
 
+	metrics.LockWaits.Inc()
+	start := time.Now()
+	done := func() time.Duration {
+		d := time.Since(start)
+		metrics.LockWaitTime.Observe(d.Seconds())
+		return d
+	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-req.ch:
-		return nil
+		return done(), nil
 	case <-timer.C:
 	}
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 	select {
 	case <-req.ch: // 超时的同时被授予
-		return nil
+		return done(), nil
 	default:
 	}
 	lm.removeReq(q, req)
 	lm.grantWaiters(q)
 	lm.gc(res, q)
-	return ErrLockTimeout
+	metrics.LockTimeouts.Inc()
+	return done(), ErrLockTimeout
 }
 
 func (lm *LockManager) track(txn uint64, res string) {

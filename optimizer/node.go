@@ -31,10 +31,13 @@ type Node struct {
 	cols  []colID
 	order *colID // 输出按该列升序
 
+	actual *executor.OpStats // EXPLAIN ANALYZE 收集的实际执行数据
+
 	// 扫描
 	rel     *rel
 	start   []byte
 	end     []byte
+	idx     *catalog.IndexInfo // 非空: 二级索引扫描，start/end 是索引键范围
 	filters []sql.Expr
 	// 连接
 	lkeys, rkeys []colID
@@ -88,4 +91,28 @@ func (p *Plan) Ops() []string {
 	}
 	walk(p.Tree)
 	return ops
+}
+
+// ExplainAnalyze 在计划被执行之后，返回带有每个算子实际行数/耗时的计划文本。
+func (p *Plan) ExplainAnalyze() []string {
+	var lines []string
+	var walk func(n *Node, depth int)
+	walk = func(n *Node, depth int) {
+		s := strings.Repeat("  ", depth) + n.Op
+		if n.Detail != "" {
+			s += " " + n.Detail
+		}
+		if n.Op != "Project" {
+			s += fmt.Sprintf("  (rows=%.0f cost=%.2f)", n.Rows, n.Cost)
+		}
+		if a := n.actual; a != nil {
+			s += fmt.Sprintf("  (actual rows=%d time=%.3fms loops=%d)", a.Rows.Load(), float64(a.Nanos.Load())/1e6, a.Loops.Load())
+		}
+		lines = append(lines, s)
+		for _, c := range n.Children {
+			walk(c, depth+1)
+		}
+	}
+	walk(p.Tree, 0)
+	return lines
 }

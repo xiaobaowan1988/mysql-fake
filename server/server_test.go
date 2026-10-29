@@ -3,17 +3,22 @@ package server
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"mysqlfake/db"
+	"mysqlfake/metrics"
 )
 
 var modes = []Mode{ModeEventLoop, ModeGoroutine}
@@ -527,6 +532,58 @@ print("PYMYSQL-OK")
 		out, err := cmd.CombinedOutput()
 		if err != nil || !strings.Contains(string(out), "PYMYSQL-OK") {
 			t.Fatalf("PyMySQL interop failed: %v\n%s", err, out)
+		}
+	})
+}
+
+func TestMetricsEndpointReflectsServerActivity(t *testing.T) {
+	forModes(t, func(t *testing.T, mode Mode) {
+		s, _ := startServer(t, mode, nil)
+		ms := httptest.NewServer(metrics.Default.Handler())
+		defer ms.Close()
+		scrape := func(sample string) float64 {
+			resp, err := http.Get(ms.URL + "/metrics")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			for _, line := range strings.Split(string(b), "\n") {
+				if strings.HasPrefix(line, sample+" ") {
+					v, _ := strconv.ParseFloat(strings.TrimPrefix(line, sample+" "), 64)
+					return v
+				}
+			}
+			return 0
+		}
+		q0 := scrape(`mysqlfake_statements_total{type="select",status="ok"}`)
+		a0 := scrape("mysqlfake_connections_accepted_total")
+		c1, c2 := dial(t, s), dial(t, s)
+		if got := scrape("mysqlfake_connections"); got != 2 {
+			t.Fatalf("connections gauge = %v", got)
+		}
+		q(t, c1, "CREATE TABLE m (id INT PRIMARY KEY)")
+		q(t, c1, "INSERT INTO m VALUES (1)")
+		for i := 0; i < 5; i++ {
+			q(t, c2, "SELECT * FROM m")
+		}
+		if got := scrape(`mysqlfake_statements_total{type="select",status="ok"}`) - q0; got != 5 {
+			t.Fatalf("select counter +%v over the wire", got)
+		}
+		if got := scrape("mysqlfake_connections_accepted_total") - a0; got != 2 {
+			t.Fatalf("accepted +%v", got)
+		}
+		c1.Quit()
+		c2.Quit()
+		deadline := time.Now().Add(2 * time.Second)
+		for scrape("mysqlfake_connections") != 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := scrape("mysqlfake_connections"); got != 0 {
+			t.Fatalf("connections gauge after quit = %v", got)
+		}
+		if scrape("mysqlfake_worker_pool_workers") < 1 {
+			t.Fatal("worker pool gauge missing")
 		}
 	})
 }

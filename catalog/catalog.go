@@ -27,11 +27,31 @@ type Meta interface {
 	SetCatalogRoot(storage.PageID) error
 }
 
+// IndexInfo 是一个二级索引 (非唯一，单列)。
+type IndexInfo struct {
+	Name      string
+	Column    int // 被索引的列下标
+	Tree      *btree.Tree
+	ValidFrom uint64 // 创建 (切换) 时的事务号: 只有在其之后建立的 Read View 才能用它做快照读
+}
+
+// TableInfo 在发布之后不可变；DDL 通过 Catalog 换成新的 TableInfo 对象。
 type TableInfo struct {
-	Name   string
-	Schema *tuple.Schema
-	PK     int // 主键列下标
-	Tree   *btree.Tree
+	Name    string
+	Schema  *tuple.Schema
+	PK      int // 主键列下标
+	Tree    *btree.Tree
+	Indexes []*IndexInfo
+}
+
+// IndexOn 返回建立在 col 列上的索引 (没有返回 nil)。
+func (t *TableInfo) IndexOn(col int) *IndexInfo {
+	for _, ix := range t.Indexes {
+		if ix.Column == col {
+			return ix
+		}
+	}
+	return nil
 }
 
 type Catalog struct {
@@ -67,12 +87,16 @@ func (c *Catalog) load() error {
 			return fmt.Errorf("catalog: corrupt entry %q", it.Key())
 		}
 		root := storage.PageID(binary.LittleEndian.Uint32(v))
-		s, _, err := tuple.UnmarshalSchema(v[4:])
+		s, n, err := tuple.UnmarshalSchema(v[4:])
 		if err != nil {
 			return fmt.Errorf("catalog: corrupt schema for %q: %w", it.Key(), err)
 		}
 		name := string(it.Key())
-		c.tables[name] = &TableInfo{Name: name, Schema: s, PK: s.PKIndex(), Tree: btree.Open(c.io, root)}
+		ti := &TableInfo{Name: name, Schema: s, PK: s.PKIndex(), Tree: btree.Open(c.io, root)}
+		if ti.Indexes, err = c.decodeIndexes(v[4+n:]); err != nil {
+			return fmt.Errorf("catalog: corrupt index list for %q: %w", it.Key(), err)
+		}
+		c.tables[name] = ti
 	}
 	return it.Err()
 }
@@ -111,15 +135,14 @@ func (c *Catalog) CreateTable(name string, cols []tuple.Column) (*TableInfo, err
 		return nil, err
 	}
 	s := &tuple.Schema{Columns: cols}
-	val := binary.LittleEndian.AppendUint32(nil, uint32(tree.Root()))
-	val = append(val, tuple.MarshalSchema(s)...)
-	if len(val) > btree.MaxValueSize {
-		return nil, errors.New("table definition too large")
+	ti := &TableInfo{Name: key, Schema: s, PK: s.PKIndex(), Tree: tree}
+	val, err := encodeTable(ti)
+	if err != nil {
+		return nil, err
 	}
 	if err := c.sys.Insert([]byte(key), val); err != nil {
 		return nil, err
 	}
-	ti := &TableInfo{Name: key, Schema: s, PK: s.PKIndex(), Tree: tree}
 	c.tables[key] = ti
 	return ti, nil
 }
@@ -162,3 +185,135 @@ func (c *Catalog) DropTable(name string) error {
 
 // IsTableExists 判断错误是否为"表已存在"。
 func IsTableExists(err error) bool { return errors.Is(err, ErrTableExists) }
+
+// 目录项: 表树根页(4) | Schema | 索引个数(2) { 名字长度(2) 名字 列下标(2) 根页(4) ValidFrom(8) }*
+func encodeTable(ti *TableInfo) ([]byte, error) {
+	val := binary.LittleEndian.AppendUint32(nil, uint32(ti.Tree.Root()))
+	val = append(val, tuple.MarshalSchema(ti.Schema)...)
+	val = binary.LittleEndian.AppendUint16(val, uint16(len(ti.Indexes)))
+	for _, ix := range ti.Indexes {
+		val = binary.LittleEndian.AppendUint16(val, uint16(len(ix.Name)))
+		val = append(val, ix.Name...)
+		val = binary.LittleEndian.AppendUint16(val, uint16(ix.Column))
+		val = binary.LittleEndian.AppendUint32(val, uint32(ix.Tree.Root()))
+		val = binary.LittleEndian.AppendUint64(val, ix.ValidFrom)
+	}
+	if len(val) > btree.MaxValueSize {
+		return nil, errors.New("table definition too large")
+	}
+	return val, nil
+}
+
+func (c *Catalog) decodeIndexes(b []byte) ([]*IndexInfo, error) {
+	if len(b) == 0 {
+		return nil, nil // 没有索引段 (旧格式)
+	}
+	if len(b) < 2 {
+		return nil, tuple.ErrCorrupt
+	}
+	n := int(binary.LittleEndian.Uint16(b))
+	pos := 2
+	var out []*IndexInfo
+	for i := 0; i < n; i++ {
+		if pos+2 > len(b) {
+			return nil, tuple.ErrCorrupt
+		}
+		l := int(binary.LittleEndian.Uint16(b[pos:]))
+		pos += 2
+		if pos+l+14 > len(b) {
+			return nil, tuple.ErrCorrupt
+		}
+		ix := &IndexInfo{Name: string(b[pos : pos+l])}
+		pos += l
+		ix.Column = int(binary.LittleEndian.Uint16(b[pos:]))
+		root := storage.PageID(binary.LittleEndian.Uint32(b[pos+2:]))
+		ix.ValidFrom = binary.LittleEndian.Uint64(b[pos+6:])
+		ix.Tree = btree.Open(c.io, root)
+		pos += 14
+		out = append(out, ix)
+	}
+	return out, nil
+}
+
+// publish 持久化并替换内存中的 TableInfo (调用方持有 c.mu)。
+func (c *Catalog) publish(ti *TableInfo) error {
+	val, err := encodeTable(ti)
+	if err != nil {
+		return err
+	}
+	if err := c.sys.Put([]byte(ti.Name), val); err != nil {
+		return err
+	}
+	c.tables[ti.Name] = ti
+	return nil
+}
+
+var (
+	ErrIndexExists   = errors.New("index already exists")
+	ErrIndexNotFound = errors.New("index not found")
+)
+
+// AddIndex 注册一个已经建好的索引树 (Online DDL 切换时调用)。
+func (c *Catalog) AddIndex(table string, ix *IndexInfo) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	old, ok := c.tables[strings.ToLower(table)]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrTableNotFound, table)
+	}
+	for _, e := range old.Indexes {
+		if strings.EqualFold(e.Name, ix.Name) {
+			return fmt.Errorf("%w: %s", ErrIndexExists, ix.Name)
+		}
+	}
+	cp := *old
+	cp.Indexes = append(append([]*IndexInfo(nil), old.Indexes...), ix)
+	return c.publish(&cp)
+}
+
+// RemoveIndex 注销索引 (仅用于 DDL 复制失败后的撤销)。
+func (c *Catalog) RemoveIndex(table, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	old, ok := c.tables[strings.ToLower(table)]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrTableNotFound, table)
+	}
+	cp := *old
+	cp.Indexes = nil
+	found := false
+	for _, e := range old.Indexes {
+		if strings.EqualFold(e.Name, name) {
+			found = true
+			continue
+		}
+		cp.Indexes = append(cp.Indexes, e)
+	}
+	if !found {
+		return fmt.Errorf("%w: %s", ErrIndexNotFound, name)
+	}
+	return c.publish(&cp)
+}
+
+// ReplaceTable 原子地换上新的表结构和数据树 (ADD COLUMN 切换)，保留索引。返回被替换的旧 TableInfo。
+func (c *Catalog) ReplaceTable(table string, schema *tuple.Schema, tree *btree.Tree) (*TableInfo, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	old, ok := c.tables[strings.ToLower(table)]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrTableNotFound, table)
+	}
+	cp := *old
+	cp.Schema, cp.PK, cp.Tree = schema, schema.PKIndex(), tree
+	if err := c.publish(&cp); err != nil {
+		return nil, err
+	}
+	return old, nil
+}
+
+// RestoreTable 把表恢复成给定的 TableInfo (撤销 ReplaceTable)。
+func (c *Catalog) RestoreTable(ti *TableInfo) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.publish(ti)
+}

@@ -2,7 +2,9 @@ package vector
 
 import (
 	"encoding/binary"
+	"time"
 
+	"mysqlfake/executor"
 	"mysqlfake/tuple"
 )
 
@@ -239,4 +241,32 @@ func (j *HashJoin) NextBatch() (*Batch, error) {
 		}
 		j.cur, j.sel, j.pos, j.matches, j.mpos = b, active(b), 0, nil, 0
 	}
+}
+
+// InstrumentedBatch 统计批执行器实际产生的有效行数和耗时 (EXPLAIN ANALYZE)。
+type InstrumentedBatch struct {
+	child BatchExecutor
+	st    *executor.OpStats
+}
+
+func NewInstrumented(child BatchExecutor, st *executor.OpStats) *InstrumentedBatch {
+	return &InstrumentedBatch{child, st}
+}
+
+func (i *InstrumentedBatch) Init() error {
+	start := time.Now()
+	err := i.child.Init()
+	i.st.Nanos.Add(int64(time.Since(start)))
+	i.st.Loops.Add(1)
+	return err
+}
+
+func (i *InstrumentedBatch) NextBatch() (*Batch, error) {
+	start := time.Now()
+	b, err := i.child.NextBatch()
+	i.st.Nanos.Add(int64(time.Since(start)))
+	if b != nil {
+		i.st.Rows.Add(int64(b.Count()))
+	}
+	return b, err
 }

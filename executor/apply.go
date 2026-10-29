@@ -2,6 +2,7 @@ package executor
 
 import (
 	"mysqlfake/catalog"
+	"mysqlfake/tuple"
 	"mysqlfake/txn"
 )
 
@@ -16,11 +17,28 @@ func ApplyPut(ctx *Ctx, ti *catalog.TableInfo, key, row []byte) error {
 	if err != nil {
 		return err
 	}
+	newVals, err := tuple.Unmarshal(ti.Schema, row)
+	if err != nil {
+		return err
+	}
+	var oldVals []tuple.Value
+	if found {
+		if v, derr := txn.DecodeVersion(cur); derr == nil && !v.Deleted {
+			oldVals, _ = tuple.Unmarshal(ti.Schema, v.Data)
+		}
+	}
+	adds, aerr := addIndexEntries(ti, key, oldVals, newVals)
 	if !found {
-		tx.AddUndo(txn.UndoInsert, ti.Name, tree, key, nil, row)
+		tx.AddUndo(txn.UndoInsert, ti.Name, tree, key, nil, row, adds...)
+		if aerr != nil {
+			return aerr
+		}
 		return tree.Insert(key, txn.RowVersion{TxnID: tx.ID, Data: row}.Encode())
 	}
-	undo := tx.AddUndo(txn.UndoUpdate, ti.Name, tree, key, cur, row)
+	undo := tx.AddUndo(txn.UndoUpdate, ti.Name, tree, key, cur, row, adds...)
+	if aerr != nil {
+		return aerr
+	}
 	return tree.Put(key, txn.RowVersion{TxnID: tx.ID, RollPtr: undo, Data: row}.Encode())
 }
 

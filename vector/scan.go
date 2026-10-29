@@ -51,6 +51,7 @@ func (s *Scan) NextBatch() (*Batch, error) {
 			}
 			break
 		}
+		s.ctx.Examined(1)
 		data, ok, err := s.ctx.Mgr.Resolve(view, s.it.Value())
 		if err != nil {
 			return nil, err

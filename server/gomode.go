@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"sync"
+
+	"mysqlfake/metrics"
 )
 
 // serveGoroutines: 一连接一个 goroutine 的传统模型。协议处理仍交给动态工作池执行，
@@ -22,6 +24,7 @@ func (s *Server) serveGoroutines() {
 			nc.Write(framePacket(nil, &seq, errPayload(errTooManyConns, "08004", "Too many connections")))
 			nc.Close()
 			s.rejected.Add(1)
+			metrics.ConnRejected.Inc()
 			continue
 		}
 		if tc, ok := nc.(*net.TCPConn); ok {

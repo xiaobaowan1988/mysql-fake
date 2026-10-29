@@ -45,6 +45,7 @@ func (s *IndexScan) Next() (*Row, error) { return nextVisible(s.ctx, s.table, s.
 func nextVisible(ctx *Ctx, t *catalog.TableInfo, it *btree.Iterator) (*Row, error) {
 	view := ctx.Txn.View()
 	for it.Next() {
+		ctx.Examined(1)
 		data, ok, err := ctx.Mgr.Resolve(view, it.Value())
 		if err != nil {
 			return nil, err
