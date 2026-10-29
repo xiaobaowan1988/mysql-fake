@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"mysqlfake/executor"
 	"mysqlfake/sql"
@@ -63,12 +64,19 @@ func (s *Session) Exec(query string) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := e.checkWrite(); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
 		tx.MarkWrote()
 		_, err = e.cat.CreateTable(st.Table, cols)
-		if cerr := tx.Commit(); err == nil {
-			err = cerr
-		}
 		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+		tx.AddDDLEvent(strings.TrimSpace(query))
+		if err := tx.Commit(); err != nil {
+			e.cat.DropTable(st.Table) // 复制/日志失败: 撤销本地建表
 			return nil, err
 		}
 		return &Result{}, nil
@@ -87,7 +95,7 @@ func (s *Session) Exec(query string) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		return s.run(func(ctx *executor.Ctx) (*Result, error) {
+		return s.run(true, func(ctx *executor.Ctx) (*Result, error) {
 			ins := executor.NewInsert(ctx, ti, rows)
 			if err := ins.Init(); err != nil {
 				return nil, err
@@ -100,7 +108,7 @@ func (s *Session) Exec(query string) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		return s.run(func(ctx *executor.Ctx) (*Result, error) {
+		return s.run(true, func(ctx *executor.Ctx) (*Result, error) {
 			up, err := executor.PlanUpdate(ctx, st, ti)
 			if err != nil {
 				return nil, err
@@ -116,7 +124,7 @@ func (s *Session) Exec(query string) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		return s.run(func(ctx *executor.Ctx) (*Result, error) {
+		return s.run(true, func(ctx *executor.Ctx) (*Result, error) {
 			del, err := executor.PlanDelete(ctx, st, ti)
 			if err != nil {
 				return nil, err
@@ -132,7 +140,7 @@ func (s *Session) Exec(query string) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		return s.run(func(ctx *executor.Ctx) (*Result, error) {
+		return s.run(st.Lock != sql.LockNone, func(ctx *executor.Ctx) (*Result, error) {
 			ex, names, err := executor.PlanSelect(ctx, st, ti)
 			if err != nil {
 				return nil, err
@@ -171,7 +179,12 @@ func (s *Session) endTxn(commit bool) error {
 // run 在事务上下文中执行一条语句。
 //   - 自动提交: 语句自成事务，出错整体回滚，成功则提交 (刷 WAL)。
 //   - 显式事务: 语句出错只回滚该语句 (Undo 保存点)；死锁/锁超时则回滚整个事务。
-func (s *Session) run(fn func(ctx *executor.Ctx) (*Result, error)) (*Result, error) {
+func (s *Session) run(write bool, fn func(ctx *executor.Ctx) (*Result, error)) (*Result, error) {
+	if write {
+		if err := s.eng.checkWrite(); err != nil {
+			return nil, err
+		}
+	}
 	auto := s.tx == nil
 	tx := s.tx
 	if auto {

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"mysqlfake/binlog"
 	"mysqlfake/buffer"
 	"mysqlfake/catalog"
 	"mysqlfake/storage"
@@ -24,7 +25,8 @@ type Result struct {
 
 // Options 是引擎的可选参数。
 type Options struct {
-	PoolSize int // 缓冲池页帧数，默认 256
+	PoolSize int  // 缓冲池页帧数，默认 256
+	NoBinlog bool // 不写 Binlog
 }
 
 type Engine struct {
@@ -35,7 +37,37 @@ type Engine struct {
 	mgr   *txn.Manager
 	def   *Session
 	defMu sync.Mutex
+	bl    *binlog.Log
+
+	guardMu sync.RWMutex
+	guard   func() error
 }
+
+// SetWriteGuard 设置写入守卫: 每条写语句执行前调用，返回错误则拒绝 (集群中用于只读副本)。
+func (e *Engine) SetWriteGuard(f func() error) {
+	e.guardMu.Lock()
+	e.guard = f
+	e.guardMu.Unlock()
+}
+
+func (e *Engine) checkWrite() error {
+	e.guardMu.RLock()
+	g := e.guard
+	e.guardMu.RUnlock()
+	if g == nil {
+		return nil
+	}
+	return g()
+}
+
+// SetReplicator 设置提交前的复制钩子。
+func (e *Engine) SetReplicator(f txn.ReplicateFunc) { e.mgr.SetReplicator(f) }
+
+// Binlog 返回本引擎的 Binlog (可能为 nil)。
+func (e *Engine) Binlog() *binlog.Log { return e.bl }
+
+// Manager 返回事务管理器。
+func (e *Engine) Manager() *txn.Manager { return e.mgr }
 
 func Open(path string) (*Engine, error) { return OpenWithOptions(path, Options{}) }
 
@@ -72,6 +104,12 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 		return fail(err)
 	}
 	e := &Engine{disk: d, log: lm, pool: pool, cat: cat, mgr: txn.NewManager(d, pool)}
+	if !opts.NoBinlog {
+		if e.bl, err = binlog.Open(path + ".binlog"); err != nil {
+			return fail(err)
+		}
+		e.mgr.Binlog = e.bl
+	}
 	e.def = e.NewSession()
 	return e, nil
 }
@@ -80,6 +118,11 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 func (e *Engine) Close() error {
 	e.def.Close()
 	err := e.pool.Checkpoint()
+	if e.bl != nil {
+		if e2 := e.bl.Close(); err == nil {
+			err = e2
+		}
+	}
 	if e2 := e.log.Close(); err == nil {
 		err = e2
 	}

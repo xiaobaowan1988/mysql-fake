@@ -102,7 +102,7 @@ func (in *Insert) Next() (*Row, error) {
 			return nil, err
 		}
 		if !found {
-			tx.AddUndo(txn.UndoInsert, tree, key, nil)
+			tx.AddUndo(txn.UndoInsert, in.table.Name, tree, key, nil, data)
 			err = tree.Insert(key, txn.RowVersion{TxnID: tx.ID, Data: data}.Encode())
 		} else {
 			old, derr := txn.DecodeVersion(cur)
@@ -112,7 +112,7 @@ func (in *Insert) Next() (*Row, error) {
 			if !old.Deleted {
 				return nil, fmt.Errorf("duplicate entry '%s' for key 'PRIMARY'", vals[in.table.PK])
 			}
-			undo := tx.AddUndo(txn.UndoUpdate, tree, key, cur)
+			undo := tx.AddUndo(txn.UndoUpdate, in.table.Name, tree, key, cur, data)
 			err = tree.Put(key, txn.RowVersion{TxnID: tx.ID, RollPtr: undo, Data: data}.Encode())
 		}
 		if err != nil {
@@ -169,7 +169,7 @@ func (u *Update) Next() (*Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		undo := tx.AddUndo(txn.UndoUpdate, tree, row.Key, row.Raw)
+		undo := tx.AddUndo(txn.UndoUpdate, u.table.Name, tree, row.Key, row.Raw, data)
 		if err := tree.Put(row.Key, txn.RowVersion{TxnID: tx.ID, RollPtr: undo, Data: data}.Encode()); err != nil {
 			return nil, err
 		}
@@ -206,7 +206,7 @@ func (d *Delete) Next() (*Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		undo := tx.AddUndo(txn.UndoDelete, tree, row.Key, row.Raw)
+		undo := tx.AddUndo(txn.UndoDelete, d.table.Name, tree, row.Key, row.Raw, nil)
 		if err := tree.Put(row.Key, txn.RowVersion{TxnID: tx.ID, RollPtr: undo, Deleted: true, Data: cur.Data}.Encode()); err != nil {
 			return nil, err
 		}

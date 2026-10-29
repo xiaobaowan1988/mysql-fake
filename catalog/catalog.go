@@ -144,3 +144,21 @@ func (c *Catalog) ListTables() []string {
 	sort.Strings(names)
 	return names
 }
+
+// DropTable 从 Catalog 中移除表 (仅用于 CREATE TABLE 复制失败后的回退；表页不回收)。
+func (c *Catalog) DropTable(name string) error {
+	key := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.tables[key]; !ok {
+		return fmt.Errorf("%w: %s", ErrTableNotFound, name)
+	}
+	if _, err := c.sys.Delete([]byte(key)); err != nil {
+		return err
+	}
+	delete(c.tables, key)
+	return nil
+}
+
+// IsTableExists 判断错误是否为"表已存在"。
+func IsTableExists(err error) bool { return errors.Is(err, ErrTableExists) }

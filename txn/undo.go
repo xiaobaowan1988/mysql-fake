@@ -20,6 +20,7 @@ type UndoRecord struct {
 	ID       uint64
 	TxnID    uint64
 	Kind     UndoKind
+	Table    string
 	Tree     *btree.Tree
 	Key      []byte
 	OldValue []byte
