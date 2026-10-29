@@ -324,3 +324,8 @@ func (p *Pool) DirtyCount() int {
 	}
 	return n
 }
+
+// Abort 写入回滚记录 (不需要立即刷盘)。
+func (p *Pool) Abort(txnID uint64) {
+	p.log.Append(&wal.Record{Type: wal.RecAbort, TxnID: txnID})
+}

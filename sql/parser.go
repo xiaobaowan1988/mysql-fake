@@ -3,6 +3,7 @@ package sql
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"mysqlfake/tuple"
 )
@@ -96,6 +97,21 @@ func (p *parser) statement() (Statement, error) {
 		return p.insert()
 	case p.acceptKw("SELECT"):
 		return p.selectStmt()
+	case p.acceptKw("UPDATE"):
+		return p.update()
+	case p.acceptKw("DELETE"):
+		return p.deleteStmt()
+	case p.acceptKw("BEGIN"):
+		return &BeginStmt{}, nil
+	case p.acceptKw("START"):
+		if err := p.expectKw("TRANSACTION"); err != nil {
+			return nil, err
+		}
+		return &BeginStmt{}, nil
+	case p.acceptKw("COMMIT"):
+		return &CommitStmt{}, nil
+	case p.acceptKw("ROLLBACK"):
+		return &RollbackStmt{}, nil
 	case p.acceptKw("SHOW"):
 		if err := p.expectKw("TABLES"); err != nil {
 			return nil, err
@@ -238,15 +254,87 @@ func (p *parser) selectStmt() (Statement, error) {
 		return nil, err
 	}
 	st.Table = name
-	if p.acceptKw("WHERE") {
-		if st.Where, err = p.expr(); err != nil {
-			return nil, err
+	if st.Where, err = p.optWhere(); err != nil {
+		return nil, err
+	}
+	if p.acceptWord("FOR") {
+		switch {
+		case p.acceptKw("UPDATE"):
+			st.Lock = LockUpdate
+		case p.acceptWord("SHARE"):
+			st.Lock = LockShare
+		default:
+			return nil, p.errf("expected UPDATE or SHARE after FOR")
 		}
 	}
 	return st, nil
 }
 
-// 表达式优先级: OR < AND < NOT < 比较/IS NULL < 原子
+func (p *parser) optWhere() (Expr, error) {
+	if p.acceptKw("WHERE") {
+		return p.expr()
+	}
+	return nil, nil
+}
+
+// acceptWord 匹配上下文关键字 (FOR/SHARE)，它们仍可用作普通标识符。
+func (p *parser) acceptWord(w string) bool {
+	t := p.peek()
+	if (t.kind == tIdent || t.kind == tKeyword) && strings.EqualFold(t.text, w) {
+		p.pos++
+		return true
+	}
+	return false
+}
+
+func (p *parser) update() (Statement, error) {
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("SET"); err != nil {
+		return nil, err
+	}
+	st := &UpdateStmt{Table: name}
+	for {
+		col, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectSym("="); err != nil {
+			return nil, err
+		}
+		e, err := p.addExpr()
+		if err != nil {
+			return nil, err
+		}
+		st.Sets = append(st.Sets, Assignment{Column: col, Value: e})
+		if !p.acceptSym(",") {
+			break
+		}
+	}
+	if st.Where, err = p.optWhere(); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+func (p *parser) deleteStmt() (Statement, error) {
+	if err := p.expectKw("FROM"); err != nil {
+		return nil, err
+	}
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	st := &DeleteStmt{Table: name}
+	if st.Where, err = p.optWhere(); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// 表达式优先级: OR < AND < NOT < 比较/IS NULL < 加减 < 乘 < 原子
 func (p *parser) expr() (Expr, error) { return p.orExpr() }
 
 func (p *parser) orExpr() (Expr, error) {
@@ -290,8 +378,43 @@ func (p *parser) notExpr() (Expr, error) {
 	return p.cmpExpr()
 }
 
-func (p *parser) cmpExpr() (Expr, error) {
+func (p *parser) addExpr() (Expr, error) {
+	l, err := p.mulExpr()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		t := p.peek()
+		if t.kind == tSymbol && (t.text == "+" || t.text == "-") {
+			p.pos++
+			r, err := p.mulExpr()
+			if err != nil {
+				return nil, err
+			}
+			l = &BinaryExpr{Op: t.text, Left: l, Right: r}
+			continue
+		}
+		return l, nil
+	}
+}
+
+func (p *parser) mulExpr() (Expr, error) {
 	l, err := p.atom()
+	if err != nil {
+		return nil, err
+	}
+	for p.acceptSym("*") {
+		r, err := p.atom()
+		if err != nil {
+			return nil, err
+		}
+		l = &BinaryExpr{Op: "*", Left: l, Right: r}
+	}
+	return l, nil
+}
+
+func (p *parser) cmpExpr() (Expr, error) {
+	l, err := p.addExpr()
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +430,7 @@ func (p *parser) cmpExpr() (Expr, error) {
 		switch t.text {
 		case "=", "!=", "<", "<=", ">", ">=":
 			p.pos++
-			r, err := p.atom()
+			r, err := p.addExpr()
 			if err != nil {
 				return nil, err
 			}

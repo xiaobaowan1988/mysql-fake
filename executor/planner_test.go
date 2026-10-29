@@ -16,7 +16,7 @@ func plan(t *testing.T, q string) Executor {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ex, _, err := PlanSelect(st.(*sql.SelectStmt), ti)
+	ex, _, err := PlanSelect(nil, st.(*sql.SelectStmt), ti)
 	if err != nil {
 		t.Fatal(err)
 	}

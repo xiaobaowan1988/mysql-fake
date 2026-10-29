@@ -22,6 +22,10 @@ type logicExpr struct {
 	l, r Expr
 }
 type notExpr struct{ e Expr }
+type arithExpr struct {
+	op   byte
+	l, r Expr
+}
 type isNullExpr struct {
 	e   Expr
 	not bool
@@ -90,6 +94,20 @@ func (e *notExpr) Eval(row []tuple.Value) tuple.Value {
 		return unknown
 	}
 	return boolVal(v.Int == 0)
+}
+
+func (e *arithExpr) Eval(row []tuple.Value) tuple.Value {
+	l, r := e.l.Eval(row), e.r.Eval(row)
+	if l.Null || r.Null {
+		return tuple.NullValue(tuple.TypeInt)
+	}
+	switch e.op {
+	case '+':
+		return tuple.IntValue(l.Int + r.Int)
+	case '-':
+		return tuple.IntValue(l.Int - r.Int)
+	}
+	return tuple.IntValue(l.Int * r.Int)
 }
 
 func (e *isNullExpr) Eval(row []tuple.Value) tuple.Value {

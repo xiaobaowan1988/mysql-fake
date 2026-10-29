@@ -27,6 +27,8 @@ var keywords = map[string]bool{
 	"SELECT": true, "FROM": true, "WHERE": true, "AND": true, "OR": true, "NOT": true,
 	"NULL": true, "IS": true, "PRIMARY": true, "KEY": true, "INT": true, "INTEGER": true,
 	"BIGINT": true, "VARCHAR": true, "SHOW": true, "TABLES": true,
+	"UPDATE": true, "SET": true, "DELETE": true, "BEGIN": true, "START": true,
+	"TRANSACTION": true, "COMMIT": true, "ROLLBACK": true,
 }
 
 func lex(src string) ([]token, error) {
@@ -104,7 +106,7 @@ func lex(src string) ([]token, error) {
 				i += 2
 				continue
 			}
-			if strings.IndexByte("(),;=<>*-", c) >= 0 {
+			if strings.IndexByte("(),;=<>*-+", c) >= 0 {
 				toks = append(toks, token{tSymbol, string(c), i})
 				i++
 				continue

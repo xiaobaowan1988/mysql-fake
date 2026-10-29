@@ -17,7 +17,7 @@ const (
 )
 
 const (
-	MaxRowSize = 1024
+	MaxRowSize = 1007 // B+ 树 value 上限 1024 减去 17 字节版本头
 	MaxKeySize = 256
 )
 

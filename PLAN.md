@@ -9,7 +9,7 @@
 - 所有上层模块通过 `storage.PageIO` 接口读写页 (Phase 1 由 DiskManager 实现，Phase 3 改由 BufferPool 实现)。
 - 表 = 以主键为 key 的聚簇 B+ 树；每张表必须有且仅有一个单列 PRIMARY KEY (INT 或 VARCHAR)。
 - 支持的数据类型: `INT` (int64)、`VARCHAR(n)`；支持 NULL。
-- 单行序列化后不超过 1024 字节，主键不超过 256 字节 (保证每个 B+ 树节点至少容纳 3 条记录)。
+- B+ 树 value 上限 1024 字节、key 上限 256 字节 (保证每个节点至少容纳 3 条记录)；Phase 4.3 起每行带 17 字节版本头，因此行数据本身不超过 1007 字节。
 - 目录结构: `storage/` `tuple/` `btree/` `sql/` `catalog/` `executor/` `wal/` `txn/` `db/` `cmd/mysqlfake/`。
 
 ## Phase 1: 存储与索引层 (单机文件 KV 引擎)
@@ -64,17 +64,24 @@
 - 已知限制: 不保证 B+ 树多页修改 (分裂) 的原子性；崩溃时分配但尚未写入的页会泄漏；崩溃时未提交事务的回滚 (Undo 阶段) 不在范围内。
 
 ## Phase 4: 并发与事务层 (高并发与 ACID)
-- [ ] **4.1 锁与并发控制**
-  - [ ] 实现 LockManager (管理行级锁，共享锁 S / 排他锁 X，支持 S→X 升级)
-  - [ ] 在执行器层面集成两阶段锁协议 (2PL，严格 2PL: 提交/回滚时统一释放)
-  - [ ] 实现死锁检测 (超时中断或 Wait-for Graph 环路检测，采用 Wait-for Graph)
-  - [ ] (配套) 扩展 SQL: UPDATE / DELETE / BEGIN / COMMIT / ROLLBACK 及对应执行器
-- [ ] **4.2 Undo Log 与事务回滚**
-  - [ ] 定义并实现 Undo Log 格式 (内存中的逻辑 undo: Insert/Update/Delete + 旧值)
-  - [ ] 在执行 Update/Delete 前记录反向操作
-  - [ ] 实现 `ROLLBACK` 逻辑 (逆序执行 Undo Log 恢复数据)
-- [ ] **4.3 多版本并发控制 (MVCC)**
-  - [ ] 重构 Tuple 格式：增加隐藏列 `Txn_ID` 与 `Rollback_Pointer` (及删除标记；DELETE 改为打删除标记)
-  - [ ] 实现 Read View 生成逻辑 (获取当前活跃事务快照)
-  - [ ] 实现可见性判断逻辑：基于 Read View 决定读取哪个历史版本，实现无锁读
-- 已知限制: Undo Log 仅存于内存、不做 purge；重启后之前的版本一律视为已提交可见；无间隙锁，不防幻读 (快照读由 MVCC 保证)。
+- 设计: 新增 `txn/` 包 (事务管理、锁、Undo、Read View)，`db.Session` 代表一个连接/会话；`Engine.Exec` 使用内置默认会话。
+- 设计: 事务 ID 在 Begin 时分配，文件头 nextTxnID 以批量预留方式持久化；重启后此前的所有版本视为已提交且可见。
+- 设计: 锁资源 = 表名 + 主键编码；锁在事务提交/回滚时统一释放 (严格 2PL)。
+- 设计: 隔离级别 REPEATABLE READ —— 显式事务内首次快照读时建立 Read View 并沿用到事务结束，自动提交的语句每条新建 Read View。
+  INSERT/UPDATE/DELETE 以及 `SELECT ... FOR SHARE / FOR UPDATE` 是"当前读": 加 X/S 锁后读取最新版本；普通 SELECT 是无锁快照读。
+- 设计: 语句出错只回滚该语句 (按 Undo 保存点)；死锁/锁超时则回滚整个事务。DDL (CREATE TABLE) 不允许在显式事务中执行。
+- [x] **4.1 锁与并发控制**
+  - [x] 实现 LockManager (管理行级锁，共享锁 S / 排他锁 X，支持 S→X 升级，FIFO 排队)
+  - [x] 在执行器层面集成两阶段锁协议 (2PL，严格 2PL: 提交/回滚时统一释放)
+  - [x] 实现死锁检测 (超时中断或 Wait-for Graph 环路检测，采用 Wait-for Graph，并保留超时兜底)
+  - [x] (配套) 扩展 SQL: UPDATE / DELETE / BEGIN(START TRANSACTION) / COMMIT / ROLLBACK、`SELECT ... FOR SHARE|FOR UPDATE`、表达式中的 `+ - *` 算术，及对应执行器
+- [x] **4.2 Undo Log 与事务回滚**
+  - [x] 定义并实现 Undo Log 格式 (内存中的逻辑 undo: Insert/Update/Delete + 修改前的整行存储值)
+  - [x] 在执行 Update/Delete 前记录反向操作
+  - [x] 实现 `ROLLBACK` 逻辑 (逆序执行 Undo Log 恢复数据；同时支持语句级回滚)
+- [x] **4.3 多版本并发控制 (MVCC)**
+  - [x] 重构 Tuple 格式：增加隐藏列 `Txn_ID` 与 `Rollback_Pointer` (及删除标记；DELETE 改为打删除标记，不再物理删除)
+  - [x] 实现 Read View 生成逻辑 (获取当前活跃事务快照)
+  - [x] 实现可见性判断逻辑：基于 Read View 决定读取哪个历史版本，实现无锁读
+- 已知限制: Undo Log 仅存于内存 (包括已回滚事务的记录，并发读者可能仍在引用)，仅在没有活跃事务时整体清理 (无细粒度 purge)；重启后之前的版本一律视为已提交可见，崩溃时未提交事务的修改不会被回滚；
+  无间隙锁/谓词锁，当前读不防幻读 (快照读由 MVCC 保证)；打了删除标记的行不会被物理清除。

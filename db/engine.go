@@ -8,10 +8,9 @@ import (
 
 	"mysqlfake/buffer"
 	"mysqlfake/catalog"
-	"mysqlfake/executor"
-	"mysqlfake/sql"
 	"mysqlfake/storage"
 	"mysqlfake/tuple"
+	"mysqlfake/txn"
 	"mysqlfake/wal"
 )
 
@@ -29,12 +28,13 @@ type Options struct {
 }
 
 type Engine struct {
-	mu     sync.Mutex
-	disk   *storage.DiskManager
-	log    *wal.LogManager
-	pool   *buffer.Pool
-	cat    *catalog.Catalog
-	txnSeq uint64
+	disk  *storage.DiskManager
+	log   *wal.LogManager
+	pool  *buffer.Pool
+	cat   *catalog.Catalog
+	mgr   *txn.Manager
+	def   *Session
+	defMu sync.Mutex
 }
 
 func Open(path string) (*Engine, error) { return OpenWithOptions(path, Options{}) }
@@ -71,13 +71,14 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 	if err := pool.Checkpoint(); err != nil {
 		return fail(err)
 	}
-	return &Engine{disk: d, log: lm, pool: pool, cat: cat}, nil
+	e := &Engine{disk: d, log: lm, pool: pool, cat: cat, mgr: txn.NewManager(d, pool)}
+	e.def = e.NewSession()
+	return e, nil
 }
 
 // Close 做 Checkpoint 后关闭所有文件。
 func (e *Engine) Close() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.def.Close()
 	err := e.pool.Checkpoint()
 	if e2 := e.log.Close(); err == nil {
 		err = e2
@@ -88,84 +89,15 @@ func (e *Engine) Close() error {
 	return err
 }
 
-// commit 写提交记录并刷日志: 语句返回前其修改已持久化。
-func (e *Engine) commit() error {
-	e.txnSeq++
-	return e.pool.Commit(e.txnSeq)
+// Exec 使用引擎内置的默认会话执行一条 SQL (串行)。需要并发/多连接时请用 NewSession。
+func (e *Engine) Exec(query string) (*Result, error) {
+	e.defMu.Lock()
+	defer e.defMu.Unlock()
+	return e.def.Exec(query)
 }
 
-// Exec 解析并执行一条 SQL。
-func (e *Engine) Exec(query string) (*Result, error) {
-	st, err := sql.Parse(query)
-	if err != nil {
-		return nil, err
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	switch st := st.(type) {
-	case *sql.CreateTableStmt:
-		cols := make([]tuple.Column, len(st.Columns))
-		for i, c := range st.Columns {
-			cols[i] = tuple.Column{Name: c.Name, Type: c.Type, Len: c.Len, PrimaryKey: c.PrimaryKey}
-		}
-		_, err := e.cat.CreateTable(st.Table, cols)
-		if cerr := e.commit(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			return nil, err
-		}
-		return &Result{}, nil
-	case *sql.ShowTablesStmt:
-		res := &Result{Columns: []string{"Tables"}, IsQuery: true}
-		for _, n := range e.cat.ListTables() {
-			res.Rows = append(res.Rows, []tuple.Value{tuple.StrValue(n)})
-		}
-		return res, nil
-	case *sql.InsertStmt:
-		ti, err := e.cat.GetTable(st.Table)
-		if err != nil {
-			return nil, err
-		}
-		rows, err := executor.BindInsert(st, ti)
-		if err != nil {
-			return nil, err
-		}
-		ins := executor.NewInsert(ti, rows)
-		if err := ins.Init(); err != nil {
-			return nil, err
-		}
-		_, err = ins.Next()
-		if cerr := e.commit(); err == nil {
-			err = cerr
-		}
-		return &Result{Affected: ins.Affected}, err
-	case *sql.SelectStmt:
-		ti, err := e.cat.GetTable(st.Table)
-		if err != nil {
-			return nil, err
-		}
-		ex, names, err := executor.PlanSelect(st, ti)
-		if err != nil {
-			return nil, err
-		}
-		if err := ex.Init(); err != nil {
-			return nil, err
-		}
-		res := &Result{Columns: names, IsQuery: true}
-		for {
-			r, err := ex.Next()
-			if err != nil {
-				return nil, err
-			}
-			if r == nil {
-				return res, nil
-			}
-			res.Rows = append(res.Rows, r.Values)
-		}
-	}
-	return nil, fmt.Errorf("unsupported statement")
-}
+// NewSession 创建一个独立的会话 (连接)，会话内可以使用显式事务。
+func (e *Engine) NewSession() *Session { return &Session{eng: e} }
 
 // Summary 返回 MySQL 风格的结果摘要。
 func (r *Result) Summary() string {
