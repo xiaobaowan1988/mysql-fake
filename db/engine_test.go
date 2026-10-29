@@ -1,0 +1,152 @@
+package db
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func mustExec(t *testing.T, e *Engine, q string) *Result {
+	t.Helper()
+	r, err := e.Exec(q)
+	if err != nil {
+		t.Fatalf("%s: %v", q, err)
+	}
+	return r
+}
+
+func rowsOf(r *Result) string {
+	var parts []string
+	for _, row := range r.Rows {
+		var c []string
+		for _, v := range row {
+			c = append(c, v.String())
+		}
+		parts = append(parts, strings.Join(c, ","))
+	}
+	return strings.Join(parts, ";")
+}
+
+func TestEndToEnd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "e2e.db")
+	e, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, e, "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(20), age INT)")
+	r := mustExec(t, e, "INSERT INTO users VALUES (3,'carol',25),(1,'alice',30),(2,'bob',NULL)")
+	if r.Affected != 3 {
+		t.Fatalf("affected=%d", r.Affected)
+	}
+	mustExec(t, e, "INSERT INTO users (id, name) VALUES (-7, 'neg')")
+
+	cases := map[string]string{
+		"SELECT * FROM users":                                       "-7,neg,NULL;1,alice,30;2,bob,NULL;3,carol,25",
+		"SELECT name FROM users WHERE id = 2":                       "bob",
+		"SELECT id FROM users WHERE id > 1 AND id <= 3":             "2;3",
+		"SELECT id FROM users WHERE 2 < id":                         "3",
+		"SELECT id FROM users WHERE id < 0":                         "-7",
+		"SELECT id FROM users WHERE age >= 25":                      "1;3",
+		"SELECT id FROM users WHERE age IS NULL":                    "-7;2",
+		"SELECT id FROM users WHERE NOT age IS NULL":                "1;3",
+		"SELECT id FROM users WHERE name = 'bob' OR age = 25":       "2;3",
+		"SELECT id FROM users WHERE age != 30":                      "3", // NULL 不满足
+		"SELECT name, id FROM users WHERE id = 1 OR id = 3":         "alice,1;carol,3",
+		"SELECT id FROM users WHERE id > 1 AND id < 1":              "",
+		"SELECT id FROM users WHERE id = 1 OR (id > 5 AND age > 1)": "1",
+	}
+	for q, want := range cases {
+		if got := rowsOf(mustExec(t, e, q)); got != want {
+			t.Errorf("%s\n got  %q\n want %q", q, got, want)
+		}
+	}
+
+	// 错误场景
+	for _, q := range []string{
+		"INSERT INTO users VALUES (1,'dup',1)",
+		"INSERT INTO users VALUES ('x','a',1)",
+		"INSERT INTO users VALUES (9,'a')",
+		"INSERT INTO users VALUES (NULL,'a',1)",
+		"INSERT INTO users (name) VALUES ('a')",
+		"INSERT INTO users VALUES (9,'this name is far too long for it',1)",
+		"SELECT nope FROM users",
+		"SELECT * FROM nope",
+		"SELECT * FROM users WHERE id = 'a'",
+		"SELECT * FROM users WHERE id",
+		"CREATE TABLE users (id INT PRIMARY KEY)",
+		"CREATE TABLE nopk (a INT)",
+		"CREATE TABLE twopk (a INT PRIMARY KEY, b INT PRIMARY KEY)",
+		"CREATE TABLE dupcol (a INT PRIMARY KEY, A INT)",
+	} {
+		if _, err := e.Exec(q); err == nil {
+			t.Errorf("expected error for %q", q)
+		}
+	}
+
+	// 重启后元数据与数据仍在
+	mustExec(t, e, "CREATE TABLE words (w VARCHAR(10) PRIMARY KEY)")
+	mustExec(t, e, "INSERT INTO words VALUES ('b'),('a')")
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if got := rowsOf(mustExec(t, e, "SHOW TABLES")); got != "users;words" {
+		t.Fatalf("tables: %s", got)
+	}
+	if got := rowsOf(mustExec(t, e, "SELECT * FROM words WHERE w >= 'b'")); got != "b" {
+		t.Fatalf("got %s", got)
+	}
+	if got := rowsOf(mustExec(t, e, "SELECT id FROM users WHERE id = 3")); got != "3" {
+		t.Fatalf("got %s", got)
+	}
+}
+
+func TestLargeTableIndexVsSeq(t *testing.T) {
+	e, err := Open(filepath.Join(t.TempDir(), "big.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	mustExec(t, e, "CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(100), n INT)")
+	var vals []string
+	for i := 0; i < 3000; i++ {
+		vals = append(vals, fmt.Sprintf("(%d,'%s',%d)", i, strings.Repeat("x", 80), i%10))
+	}
+	mustExec(t, e, "INSERT INTO t VALUES "+strings.Join(vals, ","))
+	// 索引范围扫描 (走 IndexScan) 与全表扫描 (n = 3 无法利用主键) 结果应一致
+	idx := mustExec(t, e, "SELECT id FROM t WHERE id >= 1000 AND id < 1100 AND n = 3")
+	all := mustExec(t, e, "SELECT id FROM t WHERE n = 3")
+	var want []string
+	for _, r := range all.Rows {
+		if r[0].Int >= 1000 && r[0].Int < 1100 {
+			want = append(want, r[0].String())
+		}
+	}
+	if len(idx.Rows) != 10 || rowsOf(idx) != strings.Join(want, ";") {
+		t.Fatalf("index scan mismatch: %q vs %q", rowsOf(idx), strings.Join(want, ";"))
+	}
+}
+
+func TestFormat(t *testing.T) {
+	e, _ := Open(filepath.Join(t.TempDir(), "f.db"))
+	defer e.Close()
+	mustExec(t, e, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10))")
+	mustExec(t, e, "INSERT INTO t VALUES (1,'alice'),(22,NULL)")
+	got := mustExec(t, e, "SELECT * FROM t").Format()
+	want := `+----+-------+
+| id | name  |
++----+-------+
+|  1 | alice |
+| 22 | NULL  |
++----+-------+
+2 rows in set
+`
+	if got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+}

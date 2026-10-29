@@ -29,19 +29,20 @@
   - [x] (可选) 实现 B+ 树 Delete (采用物理删除，**不做 Merge/再平衡**，叶子可为空)
 
 ## Phase 2: SQL 与执行层 (包上关系型外壳)
-- [ ] **2.1 解析与元数据**
-  - [ ] 接入/编写 SQL 语法解析器 (自写词法+递归下降；Phase 2 支持 CREATE TABLE / INSERT / SELECT(WHERE 含 AND/OR/比较) ；UPDATE/DELETE/事务语句在 Phase 4 扩展)
-  - [ ] 实现 Catalog 管理器 (定义系统表，持久化表名、列名、数据类型；系统表是根页记录在文件头 catalogRoot 的 B+ 树)
-  - [ ] 实现 Binder (校验 AST 中的表与列是否存在，字面量类型)
-- [ ] **2.2 基础执行器 (火山模型)**
-  - [ ] 定义基础 Executor 接口 (`Init()`, `Next()`)
-  - [ ] 实现 SeqScan Executor (全表扫描)
-  - [ ] 实现 IndexScan Executor (走 B+ 树查询；WHERE 含主键比较时由 Planner 选用)
-  - [ ] 实现 Insert Executor
-  - [ ] (配套) Filter / Projection Executor
-- [ ] **2.3 交互层**
-  - [ ] 开发 REPL 命令行终端
-  - [ ] 格式化输出查询结果集 (类似 MySQL 的 ASCII 表格)
+- [x] **2.1 解析与元数据**
+  - [x] 接入/编写 SQL 语法解析器 (自写词法+递归下降；Phase 2 支持 CREATE TABLE / INSERT / SELECT(WHERE 含 AND/OR/比较) ；UPDATE/DELETE/事务语句在 Phase 4 扩展)
+  - [x] 实现 Catalog 管理器 (定义系统表，持久化表名、列名、数据类型；系统表是根页记录在文件头 catalogRoot 的 B+ 树)
+  - [x] 实现 Binder (校验 AST 中的表与列是否存在，字面量类型)
+- [x] **2.2 基础执行器 (火山模型)**
+  - [x] 定义基础 Executor 接口 (`Init()`, `Next()`)
+  - [x] 实现 SeqScan Executor (全表扫描)
+  - [x] 实现 IndexScan Executor (走 B+ 树查询；WHERE 含主键比较时由 Planner 选用)
+  - [x] 实现 Insert Executor
+  - [x] (配套) Filter / Projection Executor
+- [x] **2.3 交互层**
+  - [x] 开发 REPL 命令行终端
+  - [x] 格式化输出查询结果集 (类似 MySQL 的 ASCII 表格)
+- 已知限制: 多行 INSERT 在 Phase 4 事务回滚实现之前不保证语句原子性；WHERE 仅支持比较/IS NULL/AND/OR/NOT，无算术表达式。
 
 ## Phase 3: 内存与持久化 (Buffer Pool 与 WAL)
 - [ ] **3.1 缓冲池管理器**
