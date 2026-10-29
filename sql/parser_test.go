@@ -40,7 +40,7 @@ func TestParseSelect(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := st.(*SelectStmt)
-	if s.Star || len(s.Items) != 2 || s.Table != "t" {
+	if s.Star || len(s.Items) != 2 || len(s.From) != 1 || s.From[0].Name != "t" || s.Limit != -1 {
 		t.Fatalf("bad ast: %+v", s)
 	}
 	and := s.Where.(*BinaryExpr)
@@ -61,7 +61,7 @@ func TestParseSelect(t *testing.T) {
 func TestParseErrors(t *testing.T) {
 	bad := []string{
 		"", "SELEC * FROM t", "SELECT FROM t", "SELECT * FROM", "CREATE TABLE t (a FLOAT)",
-		"INSERT INTO t VALUES 1", "SELECT * FROM t WHERE", "SELECT * FROM t extra",
+		"INSERT INTO t VALUES 1", "SELECT * FROM t WHERE", "SELECT * FROM t WHERE a = 1 extra",
 		"INSERT INTO t VALUES ('abc)", "CREATE TABLE t (a VARCHAR(0))", "SELECT * FROM t WHERE a = 99999999999999999999",
 	}
 	for _, s := range bad {
@@ -111,5 +111,45 @@ func TestParseDMLAndTxn(t *testing.T) {
 	}
 	if _, err := Parse("UPDATE t SET WHERE id=1"); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestParseJoinOrderLimitExplain(t *testing.T) {
+	st, err := Parse("SELECT a.id, b.name FROM users AS a JOIN orders b ON a.id = b.uid INNER JOIN items ON items.oid = b.id WHERE a.age > 3 ORDER BY a.id DESC, b.name LIMIT 10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := st.(*SelectStmt)
+	if len(s.From) != 3 || s.From[0].Binding() != "a" || s.From[1].Binding() != "b" || s.From[2].Binding() != "items" || s.From[0].Name != "users" {
+		t.Fatalf("bad from: %+v", s.From)
+	}
+	if s.Items[0].Table != "a" || s.Items[1].Name != "name" || len(s.OrderBy) != 2 || !s.OrderBy[0].Desc || s.OrderBy[1].Desc || s.Limit != 10 {
+		t.Fatalf("bad select: %+v", s)
+	}
+	// ON 条件被并入 WHERE: a.age > 3 AND (ON1) AND (ON2) 共 3 个合取项
+	if n := len(SplitAnd(s.Where)); n != 3 {
+		t.Fatalf("expected 3 conjuncts, got %d: %s", n, ExprString(s.Where))
+	}
+	st, err = Parse("select * from a, b, c where a.x = b.x and b.y = c.y")
+	if err != nil || len(st.(*SelectStmt).From) != 3 {
+		t.Fatalf("comma join: %v", err)
+	}
+	st, err = Parse("EXPLAIN SELECT * FROM t WHERE id = 1")
+	if err != nil || st.(*ExplainStmt).Select.From[0].Name != "t" {
+		t.Fatal("explain", err)
+	}
+	st, err = Parse("ANALYZE TABLE t;")
+	if err != nil || st.(*AnalyzeStmt).Table != "t" {
+		t.Fatal("analyze", err)
+	}
+	// FOR UPDATE 不会被当成别名
+	st, err = Parse("select * from t for update")
+	if err != nil || st.(*SelectStmt).Lock != LockUpdate || st.(*SelectStmt).From[0].Alias != "" {
+		t.Fatal("for update", err)
+	}
+	for _, bad := range []string{"select * from a join", "select * from a join b on", "select * from t order id", "select * from t limit x", "select a. from t", "explain update t set a=1"} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("expected error for %q", bad)
+		}
 	}
 }

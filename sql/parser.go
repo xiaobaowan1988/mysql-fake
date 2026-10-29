@@ -112,6 +112,24 @@ func (p *parser) statement() (Statement, error) {
 		return &CommitStmt{}, nil
 	case p.acceptKw("ROLLBACK"):
 		return &RollbackStmt{}, nil
+	case p.acceptKw("EXPLAIN"):
+		if err := p.expectKw("SELECT"); err != nil {
+			return nil, err
+		}
+		sel, err := p.selectStmt()
+		if err != nil {
+			return nil, err
+		}
+		return &ExplainStmt{Select: sel.(*SelectStmt)}, nil
+	case p.acceptKw("ANALYZE"):
+		if err := p.expectKw("TABLE"); err != nil {
+			return nil, err
+		}
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		return &AnalyzeStmt{Table: name}, nil
 	case p.acceptKw("SHOW"):
 		if err := p.expectKw("TABLES"); err != nil {
 			return nil, err
@@ -230,13 +248,49 @@ func (p *parser) insert() (Statement, error) {
 	return st, nil
 }
 
+func (p *parser) colRef() (ColumnRef, error) {
+	name, err := p.ident()
+	if err != nil {
+		return ColumnRef{}, err
+	}
+	if p.acceptSym(".") {
+		col, err := p.ident()
+		if err != nil {
+			return ColumnRef{}, err
+		}
+		return ColumnRef{Table: name, Name: col}, nil
+	}
+	return ColumnRef{Name: name}, nil
+}
+
+func (p *parser) tableRef() (TableRef, error) {
+	name, err := p.ident()
+	if err != nil {
+		return TableRef{}, err
+	}
+	ref := TableRef{Name: name}
+	if p.acceptKw("AS") {
+		if ref.Alias, err = p.ident(); err != nil {
+			return TableRef{}, err
+		}
+	} else if p.peek().kind == tIdent && !p.isWord("FOR") {
+		ref.Alias = p.next().text
+	}
+	return ref, nil
+}
+
+func (p *parser) isWord(w string) bool {
+	t := p.peek()
+	return (t.kind == tIdent || t.kind == tKeyword) && strings.EqualFold(t.text, w)
+}
+
 func (p *parser) selectStmt() (Statement, error) {
-	st := &SelectStmt{}
+	st := &SelectStmt{Limit: -1}
 	if p.acceptSym("*") {
 		st.Star = true
 	} else {
 		for {
-			c, err := p.ident()
+			c, err := p.colRef()
 			if err != nil {
 				return nil, err
 			}
@@ -249,13 +303,77 @@ func (p *parser) selectStmt() (Statement, error) {
 	if err := p.expectKw("FROM"); err != nil {
 		return nil, err
 	}
-	name, err := p.ident()
+	first, err := p.tableRef()
 	if err != nil {
 		return nil, err
 	}
-	st.Table = name
+	st.From = append(st.From, first)
+	var onConds []Expr
+	for {
+		switch {
+		case p.acceptSym(","):
+		case p.acceptKw("INNER"):
+			if err := p.expectKw("JOIN"); err != nil {
+				return nil, err
+			}
+		case p.acceptKw("JOIN"):
+		default:
+			goto joined
+		}
+		{
+			t, err := p.tableRef()
+			if err != nil {
+				return nil, err
+			}
+			st.From = append(st.From, t)
+			if p.acceptKw("ON") {
+				c, err := p.expr()
+				if err != nil {
+					return nil, err
+				}
+				onConds = append(onConds, c)
+			}
+		}
+	}
+joined:
 	if st.Where, err = p.optWhere(); err != nil {
 		return nil, err
+	}
+	for _, c := range onConds { // ON 条件与 WHERE 合并 (INNER JOIN 语义等价)
+		if st.Where == nil {
+			st.Where = c
+		} else {
+			st.Where = &BinaryExpr{Op: "AND", Left: c, Right: st.Where}
+		}
+	}
+	if p.acceptKw("ORDER") {
+		if err := p.expectKw("BY"); err != nil {
+			return nil, err
+		}
+		for {
+			c, err := p.colRef()
+			if err != nil {
+				return nil, err
+			}
+			item := OrderItem{Col: c}
+			if p.acceptKw("DESC") {
+				item.Desc = true
+			} else {
+				p.acceptKw("ASC")
+			}
+			st.OrderBy = append(st.OrderBy, item)
+			if !p.acceptSym(",") {
+				break
+			}
+		}
+	}
+	if p.acceptKw("LIMIT") {
+		t := p.next()
+		n, perr := strconv.Atoi(t.text)
+		if t.kind != tInt || perr != nil {
+			return nil, p.errf("expected a non-negative integer after LIMIT")
+		}
+		st.Limit = n
 	}
 	if p.acceptWord("FOR") {
 		switch {
@@ -461,8 +579,11 @@ func (p *parser) atom() (Expr, error) {
 		p.pos++
 		return &Literal{tuple.Value{Null: true}}, nil
 	case t.kind == tIdent:
-		p.pos++
-		return &ColumnRef{Name: t.text}, nil
+		c, err := p.colRef()
+		if err != nil {
+			return nil, err
+		}
+		return &c, nil
 	case t.kind == tSymbol && t.text == "(":
 		p.pos++
 		e, err := p.expr()

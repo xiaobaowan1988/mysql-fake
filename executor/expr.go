@@ -119,3 +119,16 @@ func EvalBool(e Expr, row []tuple.Value) bool {
 	v := e.Eval(row)
 	return !v.Null && v.Int != 0
 }
+
+// And 把多个已绑定的谓词用 AND 连接 (空列表返回 nil)。
+func And(es []Expr) Expr {
+	var out Expr
+	for _, e := range es {
+		if out == nil {
+			out = e
+		} else {
+			out = &logicExpr{and: true, l: out, r: e}
+		}
+	}
+	return out
+}

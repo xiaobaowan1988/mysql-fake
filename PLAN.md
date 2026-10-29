@@ -129,16 +129,16 @@
 - 设计: 代价模型 `cost = IO代价×页数 + CPU代价×行数`；选择率由 MCV + 直方图插值估算 (无统计时用默认值)；访问路径在 SeqScan / 主键 IndexScan 之间按代价选择。
 - 设计: Join 重排用动态规划 (Selinger，按表集合位掩码)，每个子集保留"每种有序性下的最优计划"做剪枝，优先枚举有连接条件的子集，只有图不连通才允许笛卡尔积；
   物理 Join: NestedLoop (兜底、非等值)、HashJoin (小表建哈希，内存内)、SortMergeJoin (输入已按主键有序则免排序)。
-- [ ] **7.1 统计信息搜集**
-  - [ ] 开发后台守护进程，定期采样表数据
-  - [ ] 构建列数据的等高/等宽直方图 (Histogram) 以处理数据倾斜
-- [ ] **7.2 基于成本的优化 (CBO)**
-  - [ ] 构建代价估算模型 (计算 CPU Cost 与 I/O Cost)
-  - [ ] 集成 Cascades 或动态规划优化框架 (采用动态规划)
-- [ ] **7.3 复杂算子与 Join 重排**
-  - [ ] 实现 Hash Join 和 Sort-Merge Join 算子
-  - [ ] 在优化器中实现多表 Join 的最优路径剪枝与重排
-  - [ ] (配套) SQL 扩展 (JOIN/别名/限定列/ORDER BY/LIMIT/EXPLAIN/ANALYZE) 及 Sort/Limit/NestedLoop 算子
+- [x] **7.1 统计信息搜集**
+  - [x] 开发后台守护进程，定期采样表数据
+  - [x] 构建列数据的等高/等宽直方图 (Histogram) 以处理数据倾斜
+- [x] **7.2 基于成本的优化 (CBO)**
+  - [x] 构建代价估算模型 (计算 CPU Cost 与 I/O Cost)
+  - [x] 集成 Cascades 或动态规划优化框架 (采用动态规划)
+- [x] **7.3 复杂算子与 Join 重排**
+  - [x] 实现 Hash Join 和 Sort-Merge Join 算子
+  - [x] 在优化器中实现多表 Join 的最优路径剪枝与重排
+  - [x] (配套) SQL 扩展 (JOIN/别名/限定列/ORDER BY/LIMIT/EXPLAIN/ANALYZE) 及 Sort/Limit/NestedLoop 算子
 - 已知限制: 仅 INNER JOIN；Hash Join / Sort 全内存不落盘；统计信息不持久化；无聚合与 GROUP BY。
 
 ## Phase 8: 极致计算与网络模型 (High-Performance Execution)

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"mysqlfake/executor"
+	"mysqlfake/optimizer"
 	"mysqlfake/sql"
 	"mysqlfake/tuple"
 	"mysqlfake/txn"
@@ -136,30 +137,27 @@ func (s *Session) Exec(query string) (*Result, error) {
 			return &Result{Affected: del.Affected}, err
 		})
 	case *sql.SelectStmt:
-		ti, err := e.cat.GetTable(st.Table)
-		if err != nil {
-			return nil, err
+		if st.Lock != sql.LockNone {
+			return s.lockingSelect(st)
 		}
-		return s.run(st.Lock != sql.LockNone, func(ctx *executor.Ctx) (*Result, error) {
-			ex, names, err := executor.PlanSelect(ctx, st, ti)
+		return s.run(false, func(ctx *executor.Ctx) (*Result, error) { return s.query(ctx, st) })
+	case *sql.ExplainStmt:
+		return s.run(false, func(ctx *executor.Ctx) (*Result, error) {
+			plan, err := s.plan(ctx, st.Select)
 			if err != nil {
 				return nil, err
 			}
-			if err := ex.Init(); err != nil {
-				return nil, err
+			res := &Result{Columns: []string{"QUERY PLAN"}, IsQuery: true}
+			for _, l := range plan.Explain() {
+				res.Rows = append(res.Rows, []tuple.Value{tuple.StrValue(l)})
 			}
-			res := &Result{Columns: names, IsQuery: true}
-			for {
-				r, err := ex.Next()
-				if err != nil {
-					return nil, err
-				}
-				if r == nil {
-					return res, nil
-				}
-				res.Rows = append(res.Rows, r.Values)
-			}
+			return res, nil
 		})
+	case *sql.AnalyzeStmt:
+		if err := e.Analyze(st.Table); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
 	}
 	return nil, fmt.Errorf("unsupported statement")
 }
@@ -214,4 +212,70 @@ func (s *Session) run(write bool, fn func(ctx *executor.Ctx) (*Result, error)) (
 		}
 	}
 	return nil, err
+}
+
+func (s *Session) plan(ctx *executor.Ctx, st *sql.SelectStmt) (*optimizer.Plan, error) {
+	e := s.eng
+	if len(st.From) > 1 {
+		names := make([]string, len(st.From))
+		for i, f := range st.From {
+			names[i] = f.Name
+		}
+		e.ensureStats(names)
+	}
+	pl := &optimizer.Planner{Cat: e.cat, Stats: e.stats, Opts: e.statsOpt.Planner}
+	return pl.PlanSelect(ctx, st)
+}
+
+// query 用优化器规划并执行一条普通 (快照读) SELECT。
+func (s *Session) query(ctx *executor.Ctx, st *sql.SelectStmt) (*Result, error) {
+	plan, err := s.plan(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+	if err := plan.Root.Init(); err != nil {
+		return nil, err
+	}
+	res := &Result{Columns: plan.Columns, IsQuery: true}
+	for {
+		r, err := plan.Root.Next()
+		if err != nil {
+			return nil, err
+		}
+		if r == nil {
+			return res, nil
+		}
+		res.Rows = append(res.Rows, r.Values)
+	}
+}
+
+// lockingSelect: SELECT ... FOR SHARE/UPDATE 是单表的当前读，使用基础执行器。
+func (s *Session) lockingSelect(st *sql.SelectStmt) (*Result, error) {
+	if len(st.From) != 1 || len(st.OrderBy) > 0 || st.Limit >= 0 {
+		return nil, fmt.Errorf("FOR SHARE/UPDATE supports a single table without ORDER BY/LIMIT")
+	}
+	ti, err := s.eng.cat.GetTable(st.From[0].Name)
+	if err != nil {
+		return nil, err
+	}
+	return s.run(true, func(ctx *executor.Ctx) (*Result, error) {
+		ex, names, err := executor.PlanSelect(ctx, st, ti)
+		if err != nil {
+			return nil, err
+		}
+		if err := ex.Init(); err != nil {
+			return nil, err
+		}
+		res := &Result{Columns: names, IsQuery: true}
+		for {
+			r, err := ex.Next()
+			if err != nil {
+				return nil, err
+			}
+			if r == nil {
+				return res, nil
+			}
+			res.Rows = append(res.Rows, r.Values)
+		}
+	})
 }

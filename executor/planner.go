@@ -29,14 +29,34 @@ func kindOf(t tuple.Type) kind {
 
 // BindExpr 校验 AST 表达式中的列是否存在、类型是否匹配，并生成可求值的表达式。
 func BindExpr(e sql.Expr, s *tuple.Schema) (Expr, error) {
-	be, k, err := bind(e, s)
+	return BindPredicate(e, schemaResolver(s))
+}
+
+// Resolver 把 (表限定名, 列名) 解析为输入行中的位置和类型。
+type Resolver func(table, name string) (idx int, t tuple.Type, err error)
+
+func schemaResolver(s *tuple.Schema) Resolver {
+	return func(_, name string) (int, tuple.Type, error) {
+		i := s.ColumnIndex(name)
+		if i < 0 {
+			return 0, 0, fmt.Errorf("unknown column '%s'", name)
+		}
+		return i, s.Columns[i].Type, nil
+	}
+}
+
+// BindPredicate 在给定的列解析规则下绑定一个布尔表达式。
+func BindPredicate(e sql.Expr, res Resolver) (Expr, error) {
+	be, k, err := bindExpr(e, res)
 	if err == nil && k != kBool {
 		return nil, fmt.Errorf("WHERE clause must be a boolean expression")
 	}
 	return be, err
 }
 
-func bind(e sql.Expr, s *tuple.Schema) (Expr, kind, error) {
+func bind(e sql.Expr, s *tuple.Schema) (Expr, kind, error) { return bindExpr(e, schemaResolver(s)) }
+
+func bindExpr(e sql.Expr, res Resolver) (Expr, kind, error) {
 	switch e := e.(type) {
 	case *sql.Literal:
 		if e.Value.Null {
@@ -44,13 +64,13 @@ func bind(e sql.Expr, s *tuple.Schema) (Expr, kind, error) {
 		}
 		return &litExpr{e.Value}, kindOf(e.Value.Type), nil
 	case *sql.ColumnRef:
-		i := s.ColumnIndex(e.Name)
-		if i < 0 {
-			return nil, 0, fmt.Errorf("unknown column '%s'", e.Name)
+		i, t, err := res(e.Table, e.Name)
+		if err != nil {
+			return nil, 0, err
 		}
-		return &colExpr{i}, kindOf(s.Columns[i].Type), nil
+		return &colExpr{i}, kindOf(t), nil
 	case *sql.NotExpr:
-		x, k, err := bind(e.Expr, s)
+		x, k, err := bindExpr(e.Expr, res)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -59,17 +79,17 @@ func bind(e sql.Expr, s *tuple.Schema) (Expr, kind, error) {
 		}
 		return &notExpr{x}, kBool, nil
 	case *sql.IsNullExpr:
-		x, _, err := bind(e.Expr, s)
+		x, _, err := bindExpr(e.Expr, res)
 		if err != nil {
 			return nil, 0, err
 		}
 		return &isNullExpr{x, e.Not}, kBool, nil
 	case *sql.BinaryExpr:
-		l, lk, err := bind(e.Left, s)
+		l, lk, err := bindExpr(e.Left, res)
 		if err != nil {
 			return nil, 0, err
 		}
-		r, rk, err := bind(e.Right, s)
+		r, rk, err := bindExpr(e.Right, res)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -165,7 +185,9 @@ func analyzeWhere(where sql.Expr, ti *catalog.TableInfo) (scanSpec, error) {
 	if sp.pred, err = BindExpr(where, ti.Schema); err != nil {
 		return sp, err
 	}
-	sp.start, sp.end, sp.ranged = pkRange(where, ti)
+	sp.start, sp.end, sp.ranged = PKRange(where, ti, func(c *sql.ColumnRef) bool {
+		return strings.EqualFold(c.Name, ti.Schema.Columns[ti.PK].Name)
+	})
 	return sp, nil
 }
 
@@ -196,10 +218,10 @@ func PlanSelect(ctx *Ctx, st *sql.SelectStmt, ti *catalog.TableInfo) (Executor, 
 			names = append(names, c.Name)
 		}
 	} else {
-		for _, n := range st.Items {
-			i := ti.Schema.ColumnIndex(n)
+		for _, ref := range st.Items {
+			i := ti.Schema.ColumnIndex(ref.Name)
 			if i < 0 {
-				return nil, nil, fmt.Errorf("unknown column '%s'", n)
+				return nil, nil, fmt.Errorf("unknown column '%s'", ref.Name)
 			}
 			proj = append(proj, i)
 			names = append(names, ti.Schema.Columns[i].Name)
@@ -264,8 +286,8 @@ func PlanDelete(ctx *Ctx, st *sql.DeleteStmt, ti *catalog.TableInfo) (*Delete, e
 	return &Delete{ctx: ctx, table: ti, child: child}, nil
 }
 
-// pkRange 从 WHERE 的顶层 AND 合取项中提取主键范围 [start, end)。
-func pkRange(where sql.Expr, ti *catalog.TableInfo) (start, end []byte, ok bool) {
+// PKRange 从 WHERE 的顶层 AND 合取项中提取主键范围 [start, end)。isPKRef 判断一个列引用是否指向该表的主键列。
+func PKRange(where sql.Expr, ti *catalog.TableInfo, isPKRef func(*sql.ColumnRef) bool) (start, end []byte, ok bool) {
 	pk := ti.Schema.Columns[ti.PK]
 	var visit func(e sql.Expr)
 	visit = func(e sql.Expr) {
@@ -280,9 +302,9 @@ func pkRange(where sql.Expr, ti *catalog.TableInfo) (start, end []byte, ok bool)
 		}
 		op, lit := b.Op, (*sql.Literal)(nil)
 		switch l, r := b.Left, b.Right; {
-		case isPK(l, pk.Name) && isLit(r):
+		case isPK(l, isPKRef) && isLit(r):
 			lit = r.(*sql.Literal)
-		case isPK(r, pk.Name) && isLit(l):
+		case isPK(r, isPKRef) && isLit(l):
 			lit = l.(*sql.Literal)
 			op = flip(op)
 		default:
@@ -322,9 +344,9 @@ func pkRange(where sql.Expr, ti *catalog.TableInfo) (start, end []byte, ok bool)
 	return
 }
 
-func isPK(e sql.Expr, name string) bool {
+func isPK(e sql.Expr, isPKRef func(*sql.ColumnRef) bool) bool {
 	c, ok := e.(*sql.ColumnRef)
-	return ok && strings.EqualFold(c.Name, name)
+	return ok && isPKRef(c)
 }
 
 func isLit(e sql.Expr) bool { _, ok := e.(*sql.Literal); return ok }

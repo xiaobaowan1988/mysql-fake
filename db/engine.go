@@ -10,6 +10,8 @@ import (
 	"mysqlfake/binlog"
 	"mysqlfake/buffer"
 	"mysqlfake/catalog"
+	"mysqlfake/optimizer"
+	"mysqlfake/stats"
 	"mysqlfake/storage"
 	"mysqlfake/tuple"
 	"mysqlfake/txn"
@@ -31,18 +33,25 @@ type Options struct {
 
 	CheckpointInterval time.Duration // 后台 Fuzzy Checkpoint 间隔，0 表示默认 10s，负数表示关闭
 	CheckpointLogBytes int64         // WAL 超过该大小也触发 Checkpoint，0 表示默认 16MB
+
+	StatsInterval   time.Duration     // 统计信息后台采样间隔，0 表示默认 30s，负数表示关闭
+	StatsSampleSize int               // 每表蓄水池采样行数，默认 10000
+	Planner         optimizer.Options // 优化器选项 (测试用: 强制 Join 算法等)
 }
 
 type Engine struct {
-	disk     *storage.DiskManager
-	log      *wal.LogManager
-	pool     *buffer.Pool
-	cat      *catalog.Catalog
-	mgr      *txn.Manager
-	def      *Session
-	defMu    sync.Mutex
-	bl       *binlog.Log
-	stopCkpt func()
+	disk      *storage.DiskManager
+	log       *wal.LogManager
+	pool      *buffer.Pool
+	cat       *catalog.Catalog
+	mgr       *txn.Manager
+	def       *Session
+	defMu     sync.Mutex
+	bl        *binlog.Log
+	stopCkpt  func()
+	stats     *stats.Store
+	statsOpt  Options
+	stopStats func()
 
 	guardMu sync.RWMutex
 	guard   func() error
@@ -116,6 +125,22 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 		e.mgr.Binlog = e.bl
 	}
 	e.def = e.NewSession()
+	e.stats = stats.NewStore()
+	e.statsOpt = opts
+	e.mgr.Subscribe(func(rec *binlog.Txn) { // 统计修改计数: 触发后台重新采样
+		for _, ev := range rec.Events {
+			if ev.Table != "" {
+				e.stats.AddMods(ev.Table, 1)
+			}
+		}
+	})
+	if opts.StatsInterval >= 0 {
+		iv := opts.StatsInterval
+		if iv == 0 {
+			iv = 30 * time.Second
+		}
+		e.stopStats = e.startStatsDaemon(iv)
+	}
 	if opts.CheckpointInterval >= 0 {
 		iv, lb := opts.CheckpointInterval, opts.CheckpointLogBytes
 		if iv == 0 {
@@ -132,6 +157,9 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 // Close 做 Checkpoint 后关闭所有文件。
 func (e *Engine) Close() error {
 	e.def.Close()
+	if e.stopStats != nil {
+		e.stopStats()
+	}
 	if e.stopCkpt != nil {
 		e.stopCkpt()
 	}
