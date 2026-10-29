@@ -45,20 +45,23 @@
 - 已知限制: 多行 INSERT 在 Phase 4 事务回滚实现之前不保证语句原子性；WHERE 仅支持比较/IS NULL/AND/OR/NOT，无算术表达式。
 
 ## Phase 3: 内存与持久化 (Buffer Pool 与 WAL)
-- [ ] **3.1 缓冲池管理器**
-  - [ ] 实现 BufferPoolManager (内存页帧 Frame 管理)
-  - [ ] 实现 LRU 或 Clock 淘汰算法
-  - [ ] 为 Page 增加读写锁 (Latch)，保障内存多线程并发安全
-  - [ ] 改造引擎：所有读写不再直连 DiskManager，全部通过 Buffer Pool 拿 Page
-- [ ] **3.2 Redo Log (持久性)**
-  - [ ] 定义 WAL 日志格式 (LSN, TxnID, PageID, Offset, Before/After Image；物理日志，记录页内变化的字节区间)
-  - [ ] 实现 LogManager (追加写日志文件，实现 `fsync` 刷盘)
-  - [ ] 修改写入逻辑：遵循 Write-Ahead Logging 原则，先写日志再改内存页 (刷脏页前必须先刷日志到 pageLSN)
-- [ ] **3.3 崩溃恢复**
-  - [ ] 编写系统启动时的 Recovery 逻辑
-  - [ ] 实现正向回放 Redo Log，恢复宕机前未刷盘的数据页 (按页 LSN 保证幂等)
-  - [ ] (配套) Checkpoint: 刷全部脏页后截断日志
-- 已知限制: 不保证 B+ 树多页修改 (分裂) 的原子性；崩溃时未提交事务的回滚 (Undo 阶段) 不在范围内。
+- [x] **3.1 缓冲池管理器**
+  - [x] 实现 BufferPoolManager (内存页帧 Frame 管理)
+  - [x] 实现 LRU 或 Clock 淘汰算法
+  - [x] 为 Page 增加读写锁 (Latch)，保障内存多线程并发安全 (锁挂在页帧 Frame 上，因为 `storage.Page` 被按值拷贝使用)
+  - [x] 改造引擎：所有读写不再直连 DiskManager，全部通过 Buffer Pool 拿 Page
+- [x] **3.2 Redo Log (持久性)**
+  - [x] 定义 WAL 日志格式 (LSN, TxnID, PageID, Offset, Before/After Image；物理日志，记录页内变化的字节区间)
+  - [x] 实现 LogManager (追加写日志文件，实现 `fsync` 刷盘)
+  - [x] 修改写入逻辑：遵循 Write-Ahead Logging 原则，先写日志再改内存页 (刷脏页前必须先刷日志到 pageLSN)
+- [x] **3.3 崩溃恢复**
+  - [x] 编写系统启动时的 Recovery 逻辑
+  - [x] 实现正向回放 Redo Log，恢复宕机前未刷盘的数据页 (按页 LSN 保证幂等)
+  - [x] (配套) Checkpoint: 刷全部脏页后截断日志
+- 设计: BufferPool 位于 `buffer/` 包 (实现 `storage.PageIO`，读写均拷贝页内容)；WAL 与恢复位于 `wal/` 包；日志 LSN 为连续序号，日志文件头记录 baseLSN，Checkpoint 后截断日志但 LSN 不回退。
+- 设计: 页写入时与帧内旧内容做字节 diff，生成若干 Update 日志 (Before/After)；新分配/释放的页首次写入记整页镜像，使重放不依赖页的旧内容。
+- 设计: B+ 树持有固定的 PageIO，因此页更新日志的 TxnID 统一记 0 (系统)；事务归属由 Commit 日志记录 (TxnID 为语句/事务 ID)。
+- 已知限制: 不保证 B+ 树多页修改 (分裂) 的原子性；崩溃时分配但尚未写入的页会泄漏；崩溃时未提交事务的回滚 (Undo 阶段) 不在范围内。
 
 ## Phase 4: 并发与事务层 (高并发与 ACID)
 - [ ] **4.1 锁与并发控制**

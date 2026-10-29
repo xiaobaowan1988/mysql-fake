@@ -248,3 +248,21 @@ func (d *DiskManager) Close() error {
 	}
 	return d.f.Close()
 }
+
+// ReadPageRaw 供崩溃恢复使用: 不检查页号上界，读不到的部分按全零处理。
+func (d *DiskManager) ReadPageRaw(id PageID, p *Page) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if id == InvalidPageID {
+		return fmt.Errorf("%w: %d", ErrBadPageID, id)
+	}
+	n, err := d.f.ReadAt(p.Data[:], int64(id)*PageSize)
+	if err != nil && err != io.EOF {
+		return err
+	}
+	for i := n; i < PageSize; i++ {
+		p.Data[i] = 0
+	}
+	p.ID = id
+	return nil
+}

@@ -6,11 +6,13 @@ import (
 	"strings"
 	"sync"
 
+	"mysqlfake/buffer"
 	"mysqlfake/catalog"
 	"mysqlfake/executor"
 	"mysqlfake/sql"
 	"mysqlfake/storage"
 	"mysqlfake/tuple"
+	"mysqlfake/wal"
 )
 
 // Result 是一条语句的执行结果。
@@ -21,26 +23,76 @@ type Result struct {
 	IsQuery  bool
 }
 
-type Engine struct {
-	mu   sync.Mutex
-	disk *storage.DiskManager
-	cat  *catalog.Catalog
+// Options 是引擎的可选参数。
+type Options struct {
+	PoolSize int // 缓冲池页帧数，默认 256
 }
 
-func Open(path string) (*Engine, error) {
+type Engine struct {
+	mu     sync.Mutex
+	disk   *storage.DiskManager
+	log    *wal.LogManager
+	pool   *buffer.Pool
+	cat    *catalog.Catalog
+	txnSeq uint64
+}
+
+func Open(path string) (*Engine, error) { return OpenWithOptions(path, Options{}) }
+
+// OpenWithOptions 打开数据库: 先做崩溃恢复 (回放 WAL)，再建立缓冲池和 Catalog。
+// 数据文件为 path，日志文件为 path+".wal"。
+func OpenWithOptions(path string, opts Options) (*Engine, error) {
+	if opts.PoolSize == 0 {
+		opts.PoolSize = 256
+	}
 	d, err := storage.OpenDiskManager(path)
 	if err != nil {
 		return nil, err
 	}
-	cat, err := catalog.Open(d, d)
+	lm, err := wal.Open(path + ".wal")
 	if err != nil {
 		d.Close()
 		return nil, err
 	}
-	return &Engine{disk: d, cat: cat}, nil
+	fail := func(err error) (*Engine, error) {
+		lm.Close()
+		d.Close()
+		return nil, err
+	}
+	if _, err := wal.Recover(d, lm); err != nil {
+		return fail(err)
+	}
+	pool := buffer.New(d, lm, opts.PoolSize)
+	cat, err := catalog.Open(pool, d)
+	if err != nil {
+		return fail(err)
+	}
+	// 首次创建 Catalog 时文件头先于系统树页落盘，这里立即做一次 Checkpoint 保证二者一致。
+	if err := pool.Checkpoint(); err != nil {
+		return fail(err)
+	}
+	return &Engine{disk: d, log: lm, pool: pool, cat: cat}, nil
 }
 
-func (e *Engine) Close() error { return e.disk.Close() }
+// Close 做 Checkpoint 后关闭所有文件。
+func (e *Engine) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	err := e.pool.Checkpoint()
+	if e2 := e.log.Close(); err == nil {
+		err = e2
+	}
+	if e2 := e.disk.Close(); err == nil {
+		err = e2
+	}
+	return err
+}
+
+// commit 写提交记录并刷日志: 语句返回前其修改已持久化。
+func (e *Engine) commit() error {
+	e.txnSeq++
+	return e.pool.Commit(e.txnSeq)
+}
 
 // Exec 解析并执行一条 SQL。
 func (e *Engine) Exec(query string) (*Result, error) {
@@ -56,7 +108,11 @@ func (e *Engine) Exec(query string) (*Result, error) {
 		for i, c := range st.Columns {
 			cols[i] = tuple.Column{Name: c.Name, Type: c.Type, Len: c.Len, PrimaryKey: c.PrimaryKey}
 		}
-		if _, err := e.cat.CreateTable(st.Table, cols); err != nil {
+		_, err := e.cat.CreateTable(st.Table, cols)
+		if cerr := e.commit(); err == nil {
+			err = cerr
+		}
+		if err != nil {
 			return nil, err
 		}
 		return &Result{}, nil
@@ -80,6 +136,9 @@ func (e *Engine) Exec(query string) (*Result, error) {
 			return nil, err
 		}
 		_, err = ins.Next()
+		if cerr := e.commit(); err == nil {
+			err = cerr
+		}
 		return &Result{Affected: ins.Affected}, err
 	case *sql.SelectStmt:
 		ti, err := e.cat.GetTable(st.Table)

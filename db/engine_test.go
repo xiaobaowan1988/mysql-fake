@@ -150,3 +150,68 @@ func TestFormat(t *testing.T) {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
 	}
 }
+
+// 模拟宕机: 不刷脏页、不做 Checkpoint，直接关闭文件。
+func (e *Engine) crash() {
+	e.log.CloseNoFlush()
+	e.disk.Close()
+}
+
+func TestCrashRecoveryEngine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "crash.db")
+	e, err := OpenWithOptions(path, Options{PoolSize: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, e, "CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(50))")
+	for i := 0; i < 100; i++ {
+		mustExec(t, e, fmt.Sprintf("INSERT INTO t VALUES (%d,'row-%d')", i, i))
+	}
+	mustExec(t, e, "CREATE TABLE u (k INT PRIMARY KEY)")
+	mustExec(t, e, "INSERT INTO u VALUES (42)")
+	if e.pool.DirtyCount() == 0 {
+		t.Fatal("expected unflushed dirty pages")
+	}
+	e.crash()
+
+	e, err = OpenWithOptions(path, Options{PoolSize: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if got := rowsOf(mustExec(t, e, "SHOW TABLES")); got != "t;u" {
+		t.Fatalf("tables after crash: %q", got)
+	}
+	if r := mustExec(t, e, "SELECT * FROM t"); len(r.Rows) != 100 {
+		t.Fatalf("rows after crash: %d", len(r.Rows))
+	}
+	if got := rowsOf(mustExec(t, e, "SELECT v FROM t WHERE id = 77")); got != "row-77" {
+		t.Fatalf("got %q", got)
+	}
+	if got := rowsOf(mustExec(t, e, "SELECT k FROM u")); got != "42" {
+		t.Fatalf("got %q", got)
+	}
+	// 恢复后可继续写入，且再次重启仍正确
+	mustExec(t, e, "INSERT INTO t VALUES (1000,'after')")
+}
+
+func TestSmallPoolEngine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "small.db")
+	e, err := OpenWithOptions(path, Options{PoolSize: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, e, "CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(200))")
+	for i := 0; i < 500; i++ {
+		mustExec(t, e, fmt.Sprintf("INSERT INTO t VALUES (%d,'%s')", i, strings.Repeat("s", 150)))
+	}
+	e.crash() // 缓冲池很小，大量页已被淘汰落盘，其余靠日志恢复
+	e, err = OpenWithOptions(path, Options{PoolSize: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if r := mustExec(t, e, "SELECT id FROM t"); len(r.Rows) != 500 {
+		t.Fatalf("rows=%d", len(r.Rows))
+	}
+}
