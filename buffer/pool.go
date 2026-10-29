@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"mysqlfake/storage"
 	"mysqlfake/wal"
@@ -18,7 +19,9 @@ type Frame struct {
 	Page     storage.Page
 	pin      int
 	dirty    bool
-	needFull bool // 新分配/释放的页，首次写入记录整页镜像
+	needFull bool   // 新分配/释放的页，首次写入记录整页镜像
+	recLSN   uint64 // 自上次刷盘后第一次弄脏该页时 (下界) 的 LSN，受 Pool.mu 保护
+	seq      uint64 // 每次写入加一，Fuzzy Checkpoint 用它判断刷盘期间页是否又被修改，受 Pool.mu 保护
 	latch    sync.RWMutex
 	lru      *list.Element
 }
@@ -36,8 +39,14 @@ type Pool struct {
 	table  map[storage.PageID]*Frame
 	frames map[*Frame]storage.PageID // 每个帧当前缓存的页 (用于遍历)
 	free   []*Frame
-	lru    *list.List // 未被 pin 的帧，Front 为最近使用
-	ckpt   sync.RWMutex
+	lru    *list.List   // 未被 pin 的帧，Front 为最近使用
+	ckpt   sync.RWMutex // 写入持读锁；"全停顿"Checkpoint 持写锁。Fuzzy Checkpoint 不使用它。
+	hold   int          // >0 时暂停 WAL 截断 (热备份期间)
+
+	cpMu    sync.Mutex // 串行化 Fuzzy Checkpoint
+	cpCount int
+
+	slowFlush func() // 测试钩子: 在 Fuzzy Checkpoint 写盘前调用 (不持任何锁)
 }
 
 var _ storage.PageIO = (*Pool)(nil)
@@ -84,7 +93,7 @@ func (p *Pool) fetchLocked(id storage.PageID) (*Frame, error) {
 }
 
 func (p *Pool) installLocked(f *Frame, id storage.PageID) {
-	f.dirty, f.needFull, f.pin = false, false, 1
+	f.dirty, f.needFull, f.pin, f.recLSN = false, false, 1, 0
 	p.table[id] = f
 	p.frames[f] = id
 }
@@ -101,6 +110,10 @@ func (p *Pool) pinLocked(f *Frame) {
 func (p *Pool) Unpin(f *Frame) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.unpinLocked(f)
+}
+
+func (p *Pool) unpinLocked(f *Frame) {
 	f.pin--
 	if f.pin == 0 {
 		f.lru = p.lru.PushFront(f)
@@ -172,11 +185,12 @@ func (p *Pool) WritePage(src *storage.Page) error {
 }
 
 // writeFrame 要求调用方已 pin 帧并持有 ckpt 读锁。
+// 顺序: 持页写锁 -> 登记"脏" (recLSN 取当前 NextLSN 作为下界，保证早于将要写的日志) -> 写日志 -> 修改内存页。
 func (p *Pool) writeFrame(f *Frame, src *storage.Page) {
 	f.WLatch()
 	defer f.WUnlatch()
 	newData := src.Data
-	copy(newData[8:16], f.Page.Data[8:16]) // 页 LSN 由日志决定，不参与 diff
+	copy(newData[8:20], f.Page.Data[8:20]) // 页 LSN 由日志决定、校验和在落盘时生成，二者都不参与 diff
 	var spans [][2]int
 	if f.needFull {
 		spans = [][2]int{{0, storage.PageSize}}
@@ -186,6 +200,14 @@ func (p *Pool) writeFrame(f *Frame, src *storage.Page) {
 	if len(spans) == 0 {
 		return
 	}
+	p.mu.Lock()
+	f.seq++
+	if !f.dirty {
+		f.dirty = true
+		f.recLSN = p.log.NextLSN()
+	}
+	f.needFull = false
+	p.mu.Unlock()
 	var lsn uint64
 	for _, s := range spans {
 		lsn = p.log.Append(&wal.Record{
@@ -198,7 +220,6 @@ func (p *Pool) writeFrame(f *Frame, src *storage.Page) {
 	}
 	f.Page.Data = newData
 	f.Page.SetLSN(lsn)
-	f.dirty, f.needFull = true, false
 }
 
 // diff 返回两页之间不同的字节区间；间隔很小的区间合并以减少日志条数。
@@ -285,15 +306,32 @@ func (p *Pool) Commit(txnID uint64) error {
 	return p.log.Flush(lsn)
 }
 
-// FlushAll 把所有脏页写回磁盘。
+// FlushAll 把所有脏页写回磁盘 (调用方需保证没有并发写入，例如持有 ckpt 写锁)。
 func (p *Pool) FlushAll() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	var batch []*storage.Page
+	var frames []*Frame
+	var maxLSN uint64
 	for f := range p.frames {
 		if f.dirty {
-			if err := p.flushFrameLocked(f); err != nil {
-				return err
+			pg := f.Page
+			batch = append(batch, &pg)
+			frames = append(frames, f)
+			if l := pg.LSN(); l > maxLSN {
+				maxLSN = l
 			}
+		}
+	}
+	if len(batch) > 0 {
+		if err := p.log.Flush(maxLSN); err != nil {
+			return err
+		}
+		if err := p.disk.WritePages(batch); err != nil {
+			return err
+		}
+		for _, f := range frames {
+			f.dirty = false
 		}
 	}
 	return p.disk.Sync()
@@ -328,4 +366,147 @@ func (p *Pool) DirtyCount() int {
 // Abort 写入回滚记录 (不需要立即刷盘)。
 func (p *Pool) Abort(txnID uint64) {
 	p.log.Append(&wal.Record{Type: wal.RecAbort, TxnID: txnID})
+}
+
+// HoldLogTruncation 暂停 WAL 截断 (热备份期间需要保留自备份起点以来的全部日志)。返回恢复函数。
+func (p *Pool) HoldLogTruncation() (release func()) {
+	p.mu.Lock()
+	p.hold++
+	p.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			p.hold--
+			p.mu.Unlock()
+		})
+	}
+}
+
+// FuzzyCheckpoint 在不阻塞写入的前提下刷脏页: 分批对脏页做"持读锁拷贝 -> 先刷日志 -> 批量写盘 (Doublewrite)"，
+// 刷盘期间又被修改的页保持为脏。全部完成并 fsync 后，Checkpoint LSN = 仍脏页的最小 recLSN
+// (没有脏页则为当前 NextLSN)，WAL 中 LSN 小于它的前缀被丢弃 (热备份期间不丢弃)。
+// 返回 Checkpoint LSN。
+func (p *Pool) FuzzyCheckpoint() (uint64, error) {
+	p.cpMu.Lock()
+	defer p.cpMu.Unlock()
+	nextLSN := p.log.NextLSN() // 之后才变脏的页，其 recLSN 一定 >= 它
+
+	p.mu.Lock()
+	var frames []*Frame
+	for f := range p.frames {
+		if f.dirty {
+			p.pinLocked(f)
+			frames = append(frames, f)
+		}
+	}
+	p.mu.Unlock()
+
+	const batchSize = 32
+	var firstErr error
+	for i := 0; i < len(frames); i += batchSize {
+		end := i + batchSize
+		if end > len(frames) {
+			end = len(frames)
+		}
+		batch := frames[i:end]
+		copies := make([]*storage.Page, len(batch))
+		seqs := make([]uint64, len(batch))
+		var maxLSN uint64
+		for j, f := range batch {
+			f.RLatch()
+			p.mu.Lock()
+			seqs[j] = f.seq
+			p.mu.Unlock()
+			pg := f.Page
+			f.RUnlatch()
+			copies[j] = &pg
+			if l := pg.LSN(); l > maxLSN {
+				maxLSN = l
+			}
+		}
+		var err error
+		if p.slowFlush != nil {
+			p.slowFlush()
+		}
+		if err = p.log.Flush(maxLSN); err == nil {
+			err = p.disk.WritePages(copies)
+		}
+		p.mu.Lock()
+		for j, f := range batch {
+			if err == nil {
+				if f.seq == seqs[j] {
+					f.dirty = false
+				} else if r := copies[j].LSN() + 1; r > f.recLSN {
+					f.recLSN = r // 刷盘后又被修改: 之后的修改 LSN 一定更大
+				}
+			}
+			p.unpinLocked(f)
+		}
+		p.mu.Unlock()
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return 0, firstErr
+	}
+	if err := p.disk.Sync(); err != nil { // 驱逐路径写出的页也要落盘后才能丢日志
+		return 0, err
+	}
+	p.mu.Lock()
+	ckpt := nextLSN
+	for f := range p.frames {
+		if f.dirty && f.recLSN < ckpt {
+			ckpt = f.recLSN
+		}
+	}
+	hold := p.hold > 0
+	p.cpCount++
+	p.mu.Unlock()
+	if !hold {
+		if _, err := p.log.TruncateBefore(ckpt); err != nil {
+			return 0, err
+		}
+	}
+	return ckpt, nil
+}
+
+// CheckpointCount 返回已完成的 Fuzzy Checkpoint 次数。
+func (p *Pool) CheckpointCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cpCount
+}
+
+// StartCheckpointer 启动后台 Fuzzy Checkpoint: 每隔 interval，或日志超过 logBytes 时执行一次。
+// 返回停止函数 (会等待后台协程退出)。
+func (p *Pool) StartCheckpointer(interval time.Duration, logBytes int64) (stop func()) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tick := time.NewTicker(interval / 10)
+		defer tick.Stop()
+		last := time.Now()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				if time.Since(last) >= interval || (logBytes > 0 && p.log.Size() >= logBytes) {
+					p.FuzzyCheckpoint()
+					last = time.Now()
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
 }

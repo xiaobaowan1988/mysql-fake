@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"mysqlfake/btree"
 	"mysqlfake/storage"
@@ -284,5 +285,179 @@ func TestCheckpointTruncatesLog(t *testing.T) {
 	defer lm.Close()
 	if len(lm.Records()) != 0 {
 		t.Fatalf("log should be empty, has %d", len(lm.Records()))
+	}
+}
+
+func fillTree(t *testing.T, tr *btree.Tree, from, to int) {
+	t.Helper()
+	for i := from; i < to; i++ {
+		if err := tr.Insert([]byte(fmt.Sprintf("key%05d", i)), bytes.Repeat([]byte("v"), 150)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func countTree(t *testing.T, tr *btree.Tree) int {
+	t.Helper()
+	n := 0
+	it := tr.Scan(nil, nil)
+	for it.Next() {
+		n++
+	}
+	if it.Err() != nil {
+		t.Fatal(it.Err())
+	}
+	return n
+}
+
+func TestFuzzyCheckpointFlushesAndTruncatesLog(t *testing.T) {
+	e := newEnv(t, 256)
+	tr, _ := btree.Create(e.pool)
+	root := tr.Root()
+	fillTree(t, tr, 0, 400)
+	e.pool.Commit(1)
+	if e.pool.DirtyCount() == 0 {
+		t.Fatal("expected dirty pages")
+	}
+	before := e.lm.Size()
+	ckpt, err := e.pool.FuzzyCheckpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.pool.DirtyCount() != 0 {
+		t.Fatal("fuzzy checkpoint must flush all dirty pages when nothing else is writing")
+	}
+	if after := e.lm.Size(); after >= before/4 {
+		t.Fatalf("log not truncated: %d -> %d (ckpt lsn %d)", before, after, ckpt)
+	}
+	// 之后继续写入再崩溃: 恢复 = 磁盘上的页 + 截断后剩余的日志
+	fillTree(t, tr, 400, 500)
+	e.pool.Commit(2)
+	e.crash()
+	e = openEnv(t, e.path, 256)
+	defer e.d.Close()
+	tr = btree.Open(e.pool, root)
+	if n := countTree(t, tr); n != 500 {
+		t.Fatalf("recovered %d keys, want 500", n)
+	}
+}
+
+func TestFuzzyCheckpointDoesNotBlockWriters(t *testing.T) {
+	e := newEnv(t, 64)
+	defer e.d.Close()
+	tr, _ := btree.Create(e.pool)
+	fillTree(t, tr, 0, 50)
+	e.pool.slowFlush = func() { time.Sleep(400 * time.Millisecond) } // 模拟慢盘
+	done := make(chan struct{})
+	go func() {
+		e.pool.FuzzyCheckpoint()
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond) // checkpoint 此时正卡在慢速刷盘上
+	start := time.Now()
+	fillTree(t, tr, 50, 80)
+	if d := time.Since(start); d > 200*time.Millisecond {
+		t.Fatalf("writers were blocked by the checkpoint for %v", d)
+	}
+	select {
+	case <-done:
+		t.Fatal("checkpoint finished too early; test is not exercising overlap")
+	default:
+	}
+	<-done
+	// 刷盘期间被修改的页必须仍是脏页，且日志没有被截过它们
+	if e.pool.DirtyCount() == 0 {
+		t.Fatal("pages modified during the checkpoint must stay dirty")
+	}
+	e.pool.slowFlush = nil
+	e.pool.Commit(1)
+	e.crash()
+}
+
+func TestFuzzyCheckpointUnderConcurrentWritesThenCrash(t *testing.T) {
+	e := newEnv(t, 32) // 小缓冲池: 同时伴随大量驱逐
+	tr, _ := btree.Create(e.pool)
+	root := tr.Root()
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	var cp sync.WaitGroup
+	cp.Add(1)
+	go func() {
+		defer cp.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if _, err := e.pool.FuzzyCheckpoint(); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}
+	}()
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 300; i++ {
+				if err := tr.Insert([]byte(fmt.Sprintf("g%d-%05d", g, i)), bytes.Repeat([]byte("x"), 120)); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(stop)
+	cp.Wait()
+	e.pool.Commit(1)
+	if e.pool.CheckpointCount() == 0 {
+		t.Fatal("no checkpoint ran")
+	}
+	e.crash()
+	e = openEnv(t, e.path, 32)
+	defer e.d.Close()
+	if n := countTree(t, btree.Open(e.pool, root)); n != 1200 {
+		t.Fatalf("recovered %d keys, want 1200", n)
+	}
+}
+
+func TestLogHeldDuringBackup(t *testing.T) {
+	e := newEnv(t, 128)
+	defer e.d.Close()
+	tr, _ := btree.Create(e.pool)
+	fillTree(t, tr, 0, 200)
+	e.pool.Commit(1)
+	release := e.pool.HoldLogTruncation()
+	size := e.lm.Size()
+	if _, err := e.pool.FuzzyCheckpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if e.lm.Size() < size {
+		t.Fatal("log must not shrink while truncation is held")
+	}
+	release()
+	if _, err := e.pool.FuzzyCheckpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if e.lm.Size() >= size/4 {
+		t.Fatal("log should shrink after release")
+	}
+}
+
+func TestBackgroundCheckpointer(t *testing.T) {
+	e := newEnv(t, 64)
+	defer e.d.Close()
+	tr, _ := btree.Create(e.pool)
+	stop := e.pool.StartCheckpointer(50*time.Millisecond, 0)
+	fillTree(t, tr, 0, 100)
+	deadline := time.Now().Add(3 * time.Second)
+	for e.pool.CheckpointCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	stop()
+	if e.pool.CheckpointCount() == 0 {
+		t.Fatal("background checkpointer never ran")
 	}
 }

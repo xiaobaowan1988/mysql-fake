@@ -20,22 +20,26 @@ import (
 //	[28:36] nextTxnID  事务 ID 分配上界 (Phase 4 使用)
 const (
 	Magic         = "MYFAKEDB"
-	FormatVersion = 1
+	FormatVersion = 2
 )
 
 var (
 	ErrBadMagic   = errors.New("storage: not a database file (bad magic)")
 	ErrBadPageID  = errors.New("storage: invalid page id")
 	ErrBadVersion = errors.New("storage: unsupported file format")
+	ErrChecksum   = errors.New("storage: page checksum mismatch (corrupt or torn page)")
 )
 
 type DiskManager struct {
-	mu          sync.Mutex
-	f           *os.File
-	numPages    uint32
-	freeHead    PageID
-	catalogRoot PageID
-	nextTxnID   uint64
+	mu            sync.Mutex
+	f             *os.File
+	dw            *os.File // Doublewrite 文件
+	dwUsed        int      // 自上次数据文件 fsync 以来已占用的 dw 槽位数
+	NoDoublewrite bool     // 关闭 Doublewrite (仅用于对比测试)
+	numPages      uint32
+	freeHead      PageID
+	catalogRoot   PageID
+	nextTxnID     uint64
 }
 
 // OpenDiskManager 打开数据库文件，不存在则创建并初始化文件头。
@@ -45,35 +49,40 @@ func OpenDiskManager(path string) (*DiskManager, error) {
 		return nil, err
 	}
 	d := &DiskManager{f: f}
+	if d.dw, err = os.OpenFile(path+".dw", os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		f.Close()
+		return nil, err
+	}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
 	if st.Size() == 0 {
+		d.dw.Truncate(0)
 		d.numPages = 1
 		d.nextTxnID = 1
 		if err := d.writeHeader(); err != nil {
-			f.Close()
+			d.closeFiles()
 			return nil, err
 		}
 		return d, nil
 	}
 	var buf [PageSize]byte
 	if _, err := f.ReadAt(buf[:], 0); err != nil {
-		f.Close()
+		d.closeFiles()
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return nil, ErrBadMagic
 		}
 		return nil, err
 	}
 	if string(buf[0:8]) != Magic {
-		f.Close()
+		d.closeFiles()
 		return nil, ErrBadMagic
 	}
 	if binary.LittleEndian.Uint32(buf[8:12]) != FormatVersion ||
 		binary.LittleEndian.Uint32(buf[12:16]) != PageSize {
-		f.Close()
+		d.closeFiles()
 		return nil, ErrBadVersion
 	}
 	d.numPages = binary.LittleEndian.Uint32(buf[16:20])
@@ -84,7 +93,19 @@ func OpenDiskManager(path string) (*DiskManager, error) {
 	if n := uint32((st.Size() + PageSize - 1) / PageSize); n > d.numPages {
 		d.numPages = n
 	}
+	// 必须在 WAL 重放之前修复撕裂页。
+	if err := d.recoverDoublewrite(); err != nil {
+		d.closeFiles()
+		return nil, err
+	}
 	return d, nil
+}
+
+func (d *DiskManager) closeFiles() {
+	d.f.Close()
+	if d.dw != nil {
+		d.dw.Close()
+	}
 }
 
 func (d *DiskManager) writeHeader() error {
@@ -115,22 +136,8 @@ func (d *DiskManager) ReadPage(id PageID, p *Page) error {
 		p.Data[i] = 0
 	}
 	p.ID = id
-	return nil
-}
-
-// WritePage 写页；若页号超出当前页数则扩展文件 (崩溃恢复重放日志时会用到)。
-func (d *DiskManager) WritePage(p *Page) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if p.ID == InvalidPageID {
-		return fmt.Errorf("%w: %d", ErrBadPageID, p.ID)
-	}
-	if _, err := d.f.WriteAt(p.Data[:], int64(p.ID)*PageSize); err != nil {
-		return err
-	}
-	if uint32(p.ID) >= d.numPages {
-		d.numPages = uint32(p.ID) + 1
-		return d.writeHeader()
+	if !p.ChecksumOK() {
+		return fmt.Errorf("%w: page %d", ErrChecksum, id)
 	}
 	return nil
 }
@@ -147,7 +154,6 @@ func (d *DiskManager) AllocatePage() (PageID, error) {
 			return 0, err
 		}
 		d.freeHead = PageID(binary.LittleEndian.Uint32(p.Payload()[0:4]))
-		zero.Reset(id)
 		if _, err := d.f.WriteAt(zero.Data[:], int64(id)*PageSize); err != nil {
 			return 0, err
 		}
@@ -155,7 +161,7 @@ func (d *DiskManager) AllocatePage() (PageID, error) {
 	}
 	id := PageID(d.numPages)
 	d.numPages++
-	zero.Reset(id)
+	// 全零页没有校验和，ChecksumOK 把它视为"已分配但从未写入"的合法页。
 	if _, err := d.f.WriteAt(zero.Data[:], int64(id)*PageSize); err != nil {
 		return 0, err
 	}
@@ -178,8 +184,7 @@ func (d *DiskManager) FreePage(id PageID) error {
 	if id == InvalidPageID || uint32(id) >= d.numPages {
 		return fmt.Errorf("%w: %d", ErrBadPageID, id)
 	}
-	p := MakeFreePage(id, d.freeHead)
-	if _, err := d.f.WriteAt(p.Data[:], int64(id)*PageSize); err != nil {
+	if err := d.writePagesLocked([]*Page{MakeFreePage(id, d.freeHead)}); err != nil {
 		return err
 	}
 	d.freeHead = id
@@ -233,20 +238,32 @@ func (d *DiskManager) SetNextTxnID(v uint64) error {
 	return d.writeHeader()
 }
 
+// Sync 把数据文件落盘；此后 Doublewrite 槽位可以安全复用。
 func (d *DiskManager) Sync() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.f.Sync()
+	return d.syncDataLocked()
+}
+
+func (d *DiskManager) syncDataLocked() error {
+	if err := d.f.Sync(); err != nil {
+		return err
+	}
+	d.dwUsed = 0
+	return nil
 }
 
 func (d *DiskManager) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if err := d.f.Sync(); err != nil {
-		d.f.Close()
-		return err
+	err := d.f.Sync()
+	if e2 := d.f.Close(); err == nil {
+		err = e2
 	}
-	return d.f.Close()
+	if e2 := d.dw.Close(); err == nil {
+		err = e2
+	}
+	return err
 }
 
 // ReadPageRaw 供崩溃恢复使用: 不检查页号上界，读不到的部分按全零处理。
@@ -264,5 +281,8 @@ func (d *DiskManager) ReadPageRaw(id PageID, p *Page) error {
 		p.Data[i] = 0
 	}
 	p.ID = id
+	if !p.ChecksumOK() {
+		return fmt.Errorf("%w: page %d", ErrChecksum, id) // 数据仍已读入 p，由调用方决定如何处理
+	}
 	return nil
 }

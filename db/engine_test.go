@@ -1,10 +1,14 @@
 package db
 
 import (
+	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func mustExec(t *testing.T, e *Engine, q string) *Result {
@@ -153,6 +157,9 @@ func TestFormat(t *testing.T) {
 
 // 模拟宕机: 不刷脏页、不做 Checkpoint，直接关闭文件。
 func (e *Engine) crash() {
+	if e.stopCkpt != nil {
+		e.stopCkpt()
+	}
 	e.log.CloseNoFlush()
 	e.disk.Close()
 }
@@ -213,5 +220,85 @@ func TestSmallPoolEngine(t *testing.T) {
 	defer e.Close()
 	if r := mustExec(t, e, "SELECT id FROM t"); len(r.Rows) != 500 {
 		t.Fatalf("rows=%d", len(r.Rows))
+	}
+}
+
+func TestTornPageRepairedByDoublewriteThenRedo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "torn.db")
+	e, err := OpenWithOptions(path, Options{PoolSize: 256, CheckpointInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, e, "CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(30))")
+	for i := 0; i < 5; i++ {
+		mustExec(t, e, fmt.Sprintf("INSERT INTO t VALUES (%d,'old-%d')", i, i))
+	}
+	root := e.cat.ListTables()
+	_ = root
+	ti, _ := e.cat.GetTable("t")
+	pid := ti.Tree.Root()
+	if err := e.Close(); err != nil { // 干净关闭: 页写盘 (经 .dw)，日志清空
+		t.Fatal(err)
+	}
+
+	e, err = OpenWithOptions(path, Options{PoolSize: 256, CheckpointInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 5; i < 10; i++ { // 只有日志，页未刷盘
+		mustExec(t, e, fmt.Sprintf("INSERT INTO t VALUES (%d,'new-%d')", i, i))
+	}
+	e.crash()
+
+	// 崩溃时该页正在被写 -> 数据文件里只有半页是好的
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	f.WriteAt(bytes.Repeat([]byte{0xEE}, 2000), int64(pid)*4096+2000)
+	f.Close()
+
+	e, err = OpenWithOptions(path, Options{PoolSize: 256, CheckpointInterval: -1})
+	if err != nil {
+		t.Fatalf("recovery must repair the torn page: %v", err)
+	}
+	defer e.Close()
+	r := mustExec(t, e, "SELECT id FROM t")
+	if len(r.Rows) != 10 {
+		t.Fatalf("expected 10 rows after repair+redo, got %d", len(r.Rows))
+	}
+}
+
+func TestBackgroundCheckpointKeepsEngineConsistent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bg.db")
+	opts := Options{PoolSize: 64, CheckpointInterval: 30 * time.Millisecond}
+	e, err := OpenWithOptions(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, e, "CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(100))")
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			s := e.NewSession()
+			for i := 0; i < 60; i++ {
+				if _, err := s.Exec(fmt.Sprintf("INSERT INTO t VALUES (%d,'%s')", g*1000+i, strings.Repeat("v", 80))); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	if e.pool.CheckpointCount() == 0 {
+		t.Fatal("background checkpoint did not run")
+	}
+	e.crash()
+	e, err = OpenWithOptions(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if r := mustExec(t, e, "SELECT id FROM t"); len(r.Rows) != 240 {
+		t.Fatalf("rows after crash: %d", len(r.Rows))
 	}
 }

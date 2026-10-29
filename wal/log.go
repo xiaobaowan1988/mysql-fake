@@ -84,6 +84,7 @@ var ErrBadLog = errors.New("wal: not a log file")
 
 type LogManager struct {
 	mu         sync.Mutex
+	path       string
 	f          *os.File
 	buf        []byte
 	nextLSN    uint64
@@ -97,7 +98,7 @@ func Open(path string) (*LogManager, error) {
 	if err != nil {
 		return nil, err
 	}
-	lm := &LogManager{f: f}
+	lm := &LogManager{f: f, path: path}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
@@ -230,6 +231,80 @@ func (lm *LogManager) Truncate() error {
 	lm.buf = lm.buf[:0]
 	lm.recovered = nil
 	return lm.resetFile()
+}
+
+// Size 返回日志文件当前大小 (含缓冲区中尚未落盘的部分)。
+func (lm *LogManager) Size() int64 {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	st, err := lm.f.Stat()
+	if err != nil {
+		return 0
+	}
+	return st.Size() + int64(len(lm.buf))
+}
+
+// TruncateBefore 丢弃 LSN 小于 lsn 的日志前缀 (Fuzzy Checkpoint 使用)，保留其余记录。
+// 通过写临时文件再原子替换实现。返回丢弃的记录数。
+func (lm *LogManager) TruncateBefore(lsn uint64) (int, error) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if err := lm.flushLocked(); err != nil {
+		return 0, err
+	}
+	data, err := io.ReadAll(io.NewSectionReader(lm.f, 0, 1<<40))
+	if err != nil {
+		return 0, err
+	}
+	var keep []byte
+	dropped := 0
+	pos := logHeaderSize
+	for pos+8 <= len(data) {
+		bl := int(binary.LittleEndian.Uint32(data[pos:]))
+		if pos+8+bl > len(data) {
+			break
+		}
+		body := data[pos+8 : pos+8+bl]
+		if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(data[pos+4:]) {
+			break
+		}
+		r, ok := decodeBody(body)
+		if !ok {
+			break
+		}
+		if r.LSN >= lsn {
+			keep = append(keep, data[pos:pos+8+bl]...)
+		} else {
+			dropped++
+		}
+		pos += 8 + bl
+	}
+	if dropped == 0 {
+		return 0, nil
+	}
+	path := lm.path
+	tmp := path + ".tmp"
+	var h [logHeaderSize]byte
+	copy(h[:8], logMagic)
+	binary.LittleEndian.PutUint64(h[8:], lm.nextLSN)
+	if err := os.WriteFile(tmp, append(h[:], keep...), 0o644); err != nil {
+		return 0, err
+	}
+	tf, err := os.OpenFile(tmp, os.O_RDWR, 0)
+	if err != nil {
+		return 0, err
+	}
+	if err := tf.Sync(); err != nil {
+		tf.Close()
+		return 0, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		tf.Close()
+		return 0, err
+	}
+	lm.f.Close()
+	lm.f = tf
+	return dropped, nil
 }
 
 // Close 刷盘并关闭文件。

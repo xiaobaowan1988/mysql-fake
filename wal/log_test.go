@@ -77,3 +77,46 @@ func TestBadLogFile(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestTruncateBefore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.wal")
+	lm, _ := Open(path)
+	for i := 0; i < 10; i++ {
+		lm.Append(&Record{Type: RecUpdate, PageID: 1, Offset: 0, Before: []byte("a"), After: []byte("b")})
+	}
+	lm.FlushAll()
+	before := lm.Size()
+	n, err := lm.TruncateBefore(7) // 丢弃 LSN 1..6
+	if err != nil || n != 6 {
+		t.Fatalf("dropped %d err %v", n, err)
+	}
+	if lm.Size() >= before {
+		t.Fatal("log did not shrink")
+	}
+	// 继续追加 (文件句柄已切换) 并再次截断，路径不能越变越长
+	lsn := lm.Append(&Record{Type: RecCommit, TxnID: 1})
+	if lsn != 11 {
+		t.Fatalf("lsn=%d", lsn)
+	}
+	if _, err := lm.TruncateBefore(9); err != nil {
+		t.Fatal(err)
+	}
+	lm.Close()
+	lm, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lm.Close()
+	recs := lm.Records()
+	if len(recs) != 3 || recs[0].LSN != 9 || recs[2].LSN != 11 || lm.NextLSN() != 12 {
+		t.Fatalf("after truncate: %+v next=%d", recs, lm.NextLSN())
+	}
+	// 全部丢弃后 LSN 仍然继续
+	lm.TruncateBefore(100)
+	lm.Close()
+	lm, _ = Open(path)
+	defer lm.Close()
+	if lm.NextLSN() != 12 {
+		t.Fatalf("LSN regressed to %d", lm.NextLSN())
+	}
+}

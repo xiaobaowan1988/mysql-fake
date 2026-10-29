@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"mysqlfake/binlog"
 	"mysqlfake/buffer"
@@ -27,17 +28,21 @@ type Result struct {
 type Options struct {
 	PoolSize int  // 缓冲池页帧数，默认 256
 	NoBinlog bool // 不写 Binlog
+
+	CheckpointInterval time.Duration // 后台 Fuzzy Checkpoint 间隔，0 表示默认 10s，负数表示关闭
+	CheckpointLogBytes int64         // WAL 超过该大小也触发 Checkpoint，0 表示默认 16MB
 }
 
 type Engine struct {
-	disk  *storage.DiskManager
-	log   *wal.LogManager
-	pool  *buffer.Pool
-	cat   *catalog.Catalog
-	mgr   *txn.Manager
-	def   *Session
-	defMu sync.Mutex
-	bl    *binlog.Log
+	disk     *storage.DiskManager
+	log      *wal.LogManager
+	pool     *buffer.Pool
+	cat      *catalog.Catalog
+	mgr      *txn.Manager
+	def      *Session
+	defMu    sync.Mutex
+	bl       *binlog.Log
+	stopCkpt func()
 
 	guardMu sync.RWMutex
 	guard   func() error
@@ -111,12 +116,25 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 		e.mgr.Binlog = e.bl
 	}
 	e.def = e.NewSession()
+	if opts.CheckpointInterval >= 0 {
+		iv, lb := opts.CheckpointInterval, opts.CheckpointLogBytes
+		if iv == 0 {
+			iv = 10 * time.Second
+		}
+		if lb == 0 {
+			lb = 16 << 20
+		}
+		e.stopCkpt = pool.StartCheckpointer(iv, lb)
+	}
 	return e, nil
 }
 
 // Close 做 Checkpoint 后关闭所有文件。
 func (e *Engine) Close() error {
 	e.def.Close()
+	if e.stopCkpt != nil {
+		e.stopCkpt()
+	}
 	err := e.pool.Checkpoint()
 	if e.bl != nil {
 		if e2 := e.bl.Close(); err == nil {

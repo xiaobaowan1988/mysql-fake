@@ -1,6 +1,9 @@
 package wal
 
 import (
+	"errors"
+	"fmt"
+
 	"mysqlfake/storage"
 )
 
@@ -12,6 +15,15 @@ func Recover(disk *storage.DiskManager, lm *LogManager) (int, error) {
 		return 0, nil
 	}
 	pages := map[storage.PageID]*storage.Page{}
+	// 每页的第一条日志是否是整页镜像: 是的话页的旧内容 (即使损坏) 无关紧要。
+	firstFull := map[storage.PageID]bool{}
+	for i := range recs {
+		if r := &recs[i]; r.Type == RecUpdate {
+			if _, seen := firstFull[r.PageID]; !seen {
+				firstFull[r.PageID] = r.Offset == 0 && len(r.After) == storage.PageSize
+			}
+		}
+	}
 	redone := 0
 	for i := range recs {
 		r := &recs[i]
@@ -22,7 +34,11 @@ func Recover(disk *storage.DiskManager, lm *LogManager) (int, error) {
 		if !ok {
 			p = &storage.Page{}
 			if err := disk.ReadPageRaw(r.PageID, p); err != nil {
-				return 0, err
+				if !errors.Is(err, storage.ErrChecksum) || !firstFull[r.PageID] {
+					return 0, fmt.Errorf("wal: unrecoverable corrupt page %d: %w", r.PageID, err)
+				}
+				p.Data = [storage.PageSize]byte{} // 将被整页镜像完全覆盖
+				p.ID = r.PageID
 			}
 			pages[r.PageID] = p
 		}

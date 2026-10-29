@@ -114,13 +114,13 @@
 - 设计: Doublewrite: 刷脏页时先把整批页顺序写入 `<db>.dw` 并 fsync，再写数据文件；启动时在 WAL 重放之前扫描 `.dw`，数据页校验失败 (撕裂) 则用 `.dw` 中完好的副本覆盖。
 - 设计: Fuzzy Checkpoint: 页帧记录 `recLSN` (首次弄脏时的 LSN)；后台协程在不阻塞写入的前提下分批刷脏页 (持页读锁拷贝)，Checkpoint LSN = 仍脏页的最小 `recLSN`，WAL 只丢弃 LSN 小于它的前缀。原有"全停顿"Checkpoint 仅用于关闭/打开。
 - 设计: B+ 树改为页级锁存器 (Latch) + 螃蟹步 (Crab Walking)：读操作逐级加 R 锁；写操作先乐观 (只对叶子加 X 锁)，叶子可能分裂才退回悲观 (沿路径加 X 锁，遇到"安全"节点释放祖先)；范围扫描沿叶子链手递手加锁。去掉树级读写锁。
-- [ ] **6.1 物理层安全**
-  - [ ] 实现 Doublewrite Buffer (双写缓冲)，防止 Linux 4KB 落盘导致的页撕裂
-  - [ ] 为所有 Page 加入 Checksum 校验机制
-- [ ] **6.2 异步落盘优化**
-  - [ ] 实现 Fuzzy Checkpoint (模糊检查点)，根据 LSN 后台异步刷盘，不阻塞写操作
-- [ ] **6.3 索引并发优化**
-  - [ ] 升级 B+ 树为 B-link 树或引入 Crab Walking (螃蟹步) 加锁协议，缓解根节点锁争用 (采用 Crab Walking + 乐观叶子加锁)
+- [x] **6.1 物理层安全**
+  - [x] 实现 Doublewrite Buffer (双写缓冲)，防止 Linux 4KB 落盘导致的页撕裂
+  - [x] 为所有 Page 加入 Checksum 校验机制
+- [x] **6.2 异步落盘优化**
+  - [x] 实现 Fuzzy Checkpoint (模糊检查点)，根据 LSN 后台异步刷盘，不阻塞写操作
+- [x] **6.3 索引并发优化**
+  - [x] 升级 B+ 树为 B-link 树或引入 Crab Walking (螃蟹步) 加锁协议，缓解根节点锁争用 (采用 Crab Walking + 乐观叶子加锁)
 
 ## Phase 7: 智能查询优化 (Query Optimizer)
 - 设计: 为支撑本阶段扩展 SQL: `FROM a [AS x] JOIN b ON ... JOIN c ON ...` / `FROM a, b WHERE ...`、限定列名 `x.col`、`ORDER BY col [DESC]`、`LIMIT n`、`EXPLAIN SELECT ...`、`ANALYZE TABLE t`；仅支持 INNER JOIN 与单表之外的只读查询 (FOR UPDATE 仍只限单表)。
