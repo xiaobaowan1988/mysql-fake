@@ -10,7 +10,8 @@
 - 表 = 以主键为 key 的聚簇 B+ 树；每张表必须有且仅有一个单列 PRIMARY KEY (INT 或 VARCHAR)。
 - 支持的数据类型: `INT` (int64)、`VARCHAR(n)`；支持 NULL。
 - B+ 树 value 上限 1024 字节、key 上限 256 字节 (保证每个节点至少容纳 3 条记录)；Phase 4.3 起每行带 17 字节版本头，因此行数据本身不超过 1007 字节。
-- 目录结构: `storage/` `tuple/` `btree/` `sql/` `catalog/` `executor/` `wal/` `txn/` `db/` `cmd/mysqlfake/`。
+- 目录结构: `storage/` `tuple/` `btree/` `sql/` `catalog/` `executor/` `wal/` `buffer/` `txn/` `db/` `cmd/mysqlfake/`；Phase 5 起新增 `binlog/` `raft/` `cluster/`，Phase 7 `stats/` `optimizer/`，Phase 8 `server/` `vector/`，Phase 9 `backup/` `metrics/`。
+- 工程约定: 严格按 Phase 顺序实现，每个 Phase 完成后单独提交；实现中发现计划与代码不一致，先改计划再改代码；每个 Phase 都带测试 (含 `-race`)。
 
 ## Phase 1: 存储与索引层 (单机文件 KV 引擎)
 - [x] **1.1 磁盘与 Page 管理**
@@ -85,3 +86,95 @@
   - [x] 实现可见性判断逻辑：基于 Read View 决定读取哪个历史版本，实现无锁读
 - 已知限制: Undo Log 仅存于内存 (包括已回滚事务的记录，并发读者可能仍在引用)，仅在没有活跃事务时整体清理 (无细粒度 purge)；重启后之前的版本一律视为已提交可见，崩溃时未提交事务的修改不会被回滚；
   无间隙锁/谓词锁，当前读不防幻读 (快照读由 MVCC 保证)；打了删除标记的行不会被物理清除。
+
+---
+*(以下为企业级特性扩展阶段)*
+
+## Phase 5: 高可用与分布式复制 (HA & Replication)
+- 设计: 复制单位是**行级逻辑日志 (Binlog)**: 事务提交时带上它产生的行事件 `Put(table,key,row) / Delete(table,key) / DDL(sql)`。事件幂等 (按序重放结果一致)，所以可被复制、重启重放、PITR 复用。
+  事务在 `txn` 中随 undo 记录同步收集事件 (一条 undo 对应一个事件，语句回滚时一并截断)。
+- 设计: 提交顺序 = Raft/复制 → Binlog 落盘 → WAL 提交记录 → 释放锁。复制失败则用 Undo 回滚本地事务，因此领导者不会留下"未复制却已提交"的数据 (同步模式)。
+- 设计: `raft/` 实现完整 Raft (选主、日志复制、提交、持久化 term/vote/log)，传输层是接口 (进程内网络用于测试和分区模拟，另有 TCP/`net/rpc` 实现)；不做日志快照/压缩 (已知限制)。
+- 设计: 租约 (Lease): 领导者只有在最近一个租约周期内收到过多数派心跳确认时才算"有效"，否则拒绝写入并降级；跟随者在租约期内收到过领导者心跳就不投票、不发起选举 (防止被隔离节点打断/脑裂)。
+- 设计: 复制模式 `sync` (等多数派提交，默认)、`semisync` (至少 N 个副本确认，超时退化为异步)、`async` (不等待)。
+  异步/半同步下旧领导者可能提交过被新领导者覆盖的事务 —— 检测到后将本节点标记为 `Diverged` 并拒绝写入，需要重新同步 (已知限制)。
+- 设计: 跟随者按 Raft 日志顺序应用事件 (事务内原子、MVCC 可见)；跟随者是只读副本，写语句返回 `ErrNotLeader` (带领导者提示)，读可选择等待追平到指定日志位置。
+- [ ] **5.1 复制协议集成**
+  - [ ] 实现 Binlog (逻辑日志)：事件格式、文件追加 + fsync、按序号读取/订阅
+  - [ ] 引入 Raft 一致性协议模块 (选主/复制/提交/持久化)，将单机日志转为分布式日志
+  - [ ] 集群节点 `cluster.Node`: 领导者经 Raft 提交事务，跟随者应用已提交日志
+- [ ] **5.2 故障转移与集群管理**
+  - [ ] 实现基于租约 (Lease) 的自动选主逻辑，防止脑裂
+  - [ ] 支持异步/半同步复制机制配置
+  - [ ] 实现只读节点 (Read Replica) 逻辑，分担主库查询压力
+- 已知限制: Raft 无日志快照，新节点只能从头追日志；节点重启后未提交事务的页修改仍按 Phase 3 的限制处理；异步模式可能丢数据。
+
+## Phase 6: 存储引擎边界防护 (Engine Hardening)
+- 设计: 页头扩展为 20 字节，新增 4 字节 CRC32 (文件格式版本升到 2，不兼容旧文件)；校验和在落盘时写入、读盘时校验，全零页视为未写过。
+- 设计: Doublewrite: 刷脏页时先把整批页顺序写入 `<db>.dw` 并 fsync，再写数据文件；启动时在 WAL 重放之前扫描 `.dw`，数据页校验失败 (撕裂) 则用 `.dw` 中完好的副本覆盖。
+- 设计: Fuzzy Checkpoint: 页帧记录 `recLSN` (首次弄脏时的 LSN)；后台协程在不阻塞写入的前提下分批刷脏页 (持页读锁拷贝)，Checkpoint LSN = 仍脏页的最小 `recLSN`，WAL 只丢弃 LSN 小于它的前缀。原有"全停顿"Checkpoint 仅用于关闭/打开。
+- 设计: B+ 树改为页级锁存器 (Latch) + 螃蟹步 (Crab Walking)：读操作逐级加 R 锁；写操作先乐观 (只对叶子加 X 锁)，叶子可能分裂才退回悲观 (沿路径加 X 锁，遇到"安全"节点释放祖先)；范围扫描沿叶子链手递手加锁。去掉树级读写锁。
+- [ ] **6.1 物理层安全**
+  - [ ] 实现 Doublewrite Buffer (双写缓冲)，防止 Linux 4KB 落盘导致的页撕裂
+  - [ ] 为所有 Page 加入 Checksum 校验机制
+- [ ] **6.2 异步落盘优化**
+  - [ ] 实现 Fuzzy Checkpoint (模糊检查点)，根据 LSN 后台异步刷盘，不阻塞写操作
+- [ ] **6.3 索引并发优化**
+  - [ ] 升级 B+ 树为 B-link 树或引入 Crab Walking (螃蟹步) 加锁协议，缓解根节点锁争用 (采用 Crab Walking + 乐观叶子加锁)
+
+## Phase 7: 智能查询优化 (Query Optimizer)
+- 设计: 为支撑本阶段扩展 SQL: `FROM a [AS x] JOIN b ON ... JOIN c ON ...` / `FROM a, b WHERE ...`、限定列名 `x.col`、`ORDER BY col [DESC]`、`LIMIT n`、`EXPLAIN SELECT ...`、`ANALYZE TABLE t`；仅支持 INNER JOIN 与单表之外的只读查询 (FOR UPDATE 仍只限单表)。
+- 设计: 统计信息: 对表做蓄水池采样 (默认最多 10000 行) 后得到行数、每列 NDV/空值比例/最小最大值、**MCV (高频值) 列表**和直方图。直方图支持等高与等宽两种，分析器检测数据倾斜后自动选择 (倾斜用等高)。
+  统计信息放内存；后台守护协程按表的修改计数 (超过阈值或从未分析) 周期性重新采样。
+- 设计: 代价模型 `cost = IO代价×页数 + CPU代价×行数`；选择率由 MCV + 直方图插值估算 (无统计时用默认值)；访问路径在 SeqScan / 主键 IndexScan 之间按代价选择。
+- 设计: Join 重排用动态规划 (Selinger，按表集合位掩码)，每个子集保留"每种有序性下的最优计划"做剪枝，优先枚举有连接条件的子集，只有图不连通才允许笛卡尔积；
+  物理 Join: NestedLoop (兜底、非等值)、HashJoin (小表建哈希，内存内)、SortMergeJoin (输入已按主键有序则免排序)。
+- [ ] **7.1 统计信息搜集**
+  - [ ] 开发后台守护进程，定期采样表数据
+  - [ ] 构建列数据的等高/等宽直方图 (Histogram) 以处理数据倾斜
+- [ ] **7.2 基于成本的优化 (CBO)**
+  - [ ] 构建代价估算模型 (计算 CPU Cost 与 I/O Cost)
+  - [ ] 集成 Cascades 或动态规划优化框架 (采用动态规划)
+- [ ] **7.3 复杂算子与 Join 重排**
+  - [ ] 实现 Hash Join 和 Sort-Merge Join 算子
+  - [ ] 在优化器中实现多表 Join 的最优路径剪枝与重排
+  - [ ] (配套) SQL 扩展 (JOIN/别名/限定列/ORDER BY/LIMIT/EXPLAIN/ANALYZE) 及 Sort/Limit/NestedLoop 算子
+- 已知限制: 仅 INNER JOIN；Hash Join / Sort 全内存不落盘；统计信息不持久化；无聚合与 GROUP BY。
+
+## Phase 8: 极致计算与网络模型 (High-Performance Execution)
+- 设计: 服务端实现 MySQL 协议子集 (握手 v10、`COM_QUERY`/`COM_PING`/`COM_QUIT`/`COM_INIT_DB`、文本结果集、OK/ERR 包)，认证不校验口令。
+- 设计: Linux 用 `epoll`、macOS/BSD 用 `kqueue` (均基于标准库 `syscall`，非阻塞 socket + 单事件循环 + 每连接状态机和读写缓冲)；其他平台退化为 goroutine-per-connection。
+  事件循环只做 I/O 和协议拆包，完整请求投递给动态工作池执行，结果写回缓冲并通过 `EPOLLOUT` 冲刷。同一连接的请求串行。
+- 设计: 动态工作池 (min/max 工作协程，积压时扩容，空闲超时缩容)，限制并发执行的语句数；"线程"在 Go 里即 goroutine，运行时再复用到 OS 线程。
+- 设计: 向量化: 新增批 (Batch) 接口 `NextBatch()`，列式存放 (INT/VARCHAR 向量 + 空值位图 + 选择向量)，批大小 1024；
+  向量化算子: Scan、Filter (按列核函数，AND/OR/NOT/比较/IS NULL)、Projection、HashJoin 探测、Limit；其余算子经行/批适配器接入，两种模式结果必须一致 (有对拍测试)。
+- [ ] **8.1 网络连接池与多路复用**
+  - [ ] 废弃“一连接一线程”，底层接入 `epoll`/`kqueue` 事件驱动模型
+  - [ ] 实现动态线程池处理客户端并发请求
+  - [ ] (配套) MySQL 协议子集编解码与测试客户端
+- [ ] **8.2 现代计算引擎**
+  - [ ] 重构执行器，实现向量化执行 (Vectorized Execution)，按列块(Batch)而非单行处理数据
+  - [ ] (可选) 引入 LLVM JIT 编译执行计划，消除火山模型的虚函数开销 —— **不实现**: Go 没有可用的 LLVM 绑定，改由向量化核函数消除逐行虚调用。
+- 已知限制: 不实现 TLS 与口令认证；预处理语句协议 (`COM_STMT_*`) 不支持。
+
+## Phase 9: Day-2 运维与可观测性 (Operations & Observability)
+- 设计: 二级索引: `CREATE INDEX name ON t(col)` (非唯一，单列，NULL 不入索引)。索引树的 key = 列值保序编码 + 主键，value 为空；
+  索引项只增不删 (回滚时仅撤销本次新增的项)，读取时回表取可见版本并校验列值仍匹配，因此对 MVCC 安全；优化器的访问路径加入二级索引。
+- 设计: Online DDL (影子拷贝 + 增量回放): `ALTER TABLE t ADD COLUMN c type [DEFAULT lit]` 与 `CREATE INDEX`。
+  ① 订阅提交事件 (复用 Phase 5 的行事件) 开始捕获 → ② 用快照分批拷贝到影子表/影子索引 → ③ 回放捕获的增量 (多轮至队列很小) → ④ 对表加元数据锁 X (等待已触及该表的事务结束，期间新事务短暂阻塞) → 回放最后增量 → ⑤ 在 Catalog 中原子切换 → 释放。
+  元数据锁 (MDL): 写事务在首次触及表时对 `mdl:<表>` 加 S 锁直到事务结束；读语句只在语句期间持有；DDL 切换时加 X。集群中 DDL 以 DDL 事件复制，跟随者同步执行。
+- 设计: 热备份 (物理，模糊但可重放): 先做 Fuzzy Checkpoint 并暂停 WAL 截断，记录 startLSN 与 binlog 位置 → 拷贝数据页 (校验和失败则重读) → 刷日志后拷贝 WAL、`.dw`，最后拷贝文件头页 → 清单 `manifest.json`。
+  增量备份只拷贝 `页 LSN > 上次备份 endLSN` 的页。还原 = 基础备份 + 依次覆盖增量页 + 用最后一份的 WAL，打开数据库时由崩溃恢复完成重放。
+- 设计: PITR: 在还原后的库上重放 Binlog (按序号/提交时间戳) 直到目标时间点；目标时间必须不早于该备份完成时间。SQL 入口: `BACKUP TO 'dir' [INCREMENTAL FROM 'basedir']`；还原由离线命令行 `mysqlfake restore` 完成。
+- 设计: 观测: `metrics/` 提供计数器/仪表/直方图并以 Prometheus 文本格式在 HTTP `/metrics` 暴露 (语句数/QPS、缓冲池命中、锁等待、事务提交/回滚/死锁、WAL 字节与 fsync、连接数、Raft 角色/任期/提交位置等)；
+  慢查询日志按阈值写文件 (耗时、扫描行数、返回行数、阶段耗时)；Profiling: 阶段耗时 (parse/plan/execute/锁等待) + `EXPLAIN ANALYZE` 的逐算子行数与耗时。
+- [ ] **9.1 在线变更 (Online DDL)**
+  - [ ] 实现二级索引 (存储、DML 维护、回滚、优化器访问路径)
+  - [ ] 实现无锁加列、建索引机制 (影子表拷贝 + 增量日志回放) 及元数据锁
+- [ ] **9.2 备份与恢复**
+  - [ ] 实现基于 LSN 的物理热备份 (Hot Backup) 工具，支持全量与增量备份
+  - [ ] 支持 PITR (Point-in-Time Recovery)，按时间点恢复数据
+- [ ] **9.3 系统观测**
+  - [ ] 接入 Prometheus 兼容的 Metrics 暴露接口 (QPS, 缓冲池命中率, 锁等待)
+  - [ ] 实现 Slow Query Log (慢查询日志) 与执行耗时细粒度 Profiling
+- 已知限制: 二级索引项不清理 (无 purge)；无 DROP INDEX/DROP COLUMN；备份期间 WAL 不截断，磁盘占用上升；PITR 目标点之前的备份必须存在。
