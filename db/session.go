@@ -17,6 +17,22 @@ import (
 type Session struct {
 	eng *Engine
 	tx  *txn.Txn // 显式事务，nil 表示自动提交
+
+	noAutocommit bool // SET autocommit = 0: 下一条语句隐式开启事务，直到 COMMIT / ROLLBACK
+}
+
+// Autocommit 返回会话是否处于自动提交模式。
+func (s *Session) Autocommit() bool { return !s.noAutocommit }
+
+// SetAutocommit 对应 SET autocommit = 0/1。重新打开自动提交时隐式提交当前事务。
+func (s *Session) SetAutocommit(on bool) error {
+	if on && s.noAutocommit && s.tx != nil {
+		if err := s.endTxn(true); err != nil {
+			return err
+		}
+	}
+	s.noAutocommit = !on
+	return nil
 }
 
 // InTxn 返回会话当前是否处于显式事务中。
@@ -54,8 +70,10 @@ func (s *Session) Exec(query string) (*Result, error) {
 	case *sql.RollbackStmt:
 		return &Result{}, s.endTxn(false)
 	case *sql.CreateTableStmt:
-		if s.tx != nil {
-			return nil, errors.New("DDL is not allowed inside a transaction")
+		if s.tx != nil { // DDL 隐式提交当前事务 (与 MySQL 一致)
+			if err := s.endTxn(true); err != nil {
+				return nil, err
+			}
 		}
 		cols := make([]tuple.Column, len(st.Columns))
 		for i, c := range st.Columns {
@@ -182,6 +200,13 @@ func (s *Session) run(write bool, fn func(ctx *executor.Ctx) (*Result, error)) (
 		if err := s.eng.checkWrite(); err != nil {
 			return nil, err
 		}
+	}
+	if s.noAutocommit && s.tx == nil { // autocommit=0: 隐式开启事务
+		tx, err := s.eng.mgr.Begin()
+		if err != nil {
+			return nil, err
+		}
+		s.tx = tx
 	}
 	auto := s.tx == nil
 	tx := s.tx

@@ -70,7 +70,7 @@
 - 设计: 锁资源 = 表名 + 主键编码；锁在事务提交/回滚时统一释放 (严格 2PL)。
 - 设计: 隔离级别 REPEATABLE READ —— 显式事务内首次快照读时建立 Read View 并沿用到事务结束，自动提交的语句每条新建 Read View。
   INSERT/UPDATE/DELETE 以及 `SELECT ... FOR SHARE / FOR UPDATE` 是"当前读": 加 X/S 锁后读取最新版本；普通 SELECT 是无锁快照读。
-- 设计: 语句出错只回滚该语句 (按 Undo 保存点)；死锁/锁超时则回滚整个事务。DDL (CREATE TABLE) 不允许在显式事务中执行。
+- 设计: 语句出错只回滚该语句 (按 Undo 保存点)；死锁/锁超时则回滚整个事务。DDL (CREATE TABLE 等) 会先隐式提交当前事务 (与 MySQL 一致)，自身不可回滚。
 - [x] **4.1 锁与并发控制**
   - [x] 实现 LockManager (管理行级锁，共享锁 S / 排他锁 X，支持 S→X 升级，FIFO 排队)
   - [x] 在执行器层面集成两阶段锁协议 (2PL，严格 2PL: 提交/回滚时统一释放)
@@ -147,13 +147,14 @@
   事件循环只做 I/O 和协议拆包，完整请求投递给动态工作池执行，结果写回缓冲并通过 `EPOLLOUT` 冲刷。同一连接的请求串行。
 - 设计: 动态工作池 (min/max 工作协程，积压时扩容，空闲超时缩容)，限制并发执行的语句数；"线程"在 Go 里即 goroutine，运行时再复用到 OS 线程。
 - 设计: 向量化: 新增批 (Batch) 接口 `NextBatch()`，列式存放 (INT/VARCHAR 向量 + 空值位图 + 选择向量)，批大小 1024；
-  向量化算子: Scan、Filter (按列核函数，AND/OR/NOT/比较/IS NULL)、Projection、HashJoin 探测、Limit；其余算子经行/批适配器接入，两种模式结果必须一致 (有对拍测试)。
-- [ ] **8.1 网络连接池与多路复用**
-  - [ ] 废弃“一连接一线程”，底层接入 `epoll`/`kqueue` 事件驱动模型
-  - [ ] 实现动态线程池处理客户端并发请求
-  - [ ] (配套) MySQL 协议子集编解码与测试客户端
-- [ ] **8.2 现代计算引擎**
-  - [ ] 重构执行器，实现向量化执行 (Vectorized Execution)，按列块(Batch)而非单行处理数据
+  向量化算子: Scan、Filter (按列核函数，AND/OR/NOT/比较/IS NULL，三值逻辑；不支持的形状如算术整体退回逐行求值)、Projection、HashJoin 探测、Limit；其余算子 (NestedLoop/MergeJoin/Sort) 经行/批适配器接入。
+  向量化是 SELECT 的默认执行模式，`optimizer.Options.RowMode` 可回退到行式；两种模式结果必须一致 (有对拍测试)。
+- [x] **8.1 网络连接池与多路复用**
+  - [x] 废弃“一连接一线程”，底层接入 `epoll`/`kqueue` 事件驱动模型
+  - [x] 实现动态线程池处理客户端并发请求
+  - [x] (配套) MySQL 协议子集编解码与测试客户端
+- [x] **8.2 现代计算引擎**
+  - [x] 重构执行器，实现向量化执行 (Vectorized Execution)，按列块(Batch)而非单行处理数据
   - [ ] (可选) 引入 LLVM JIT 编译执行计划，消除火山模型的虚函数开销 —— **不实现**: Go 没有可用的 LLVM 绑定，改由向量化核函数消除逐行虚调用。
 - 已知限制: 不实现 TLS 与口令认证；预处理语句协议 (`COM_STMT_*`) 不支持。
 

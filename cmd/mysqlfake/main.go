@@ -1,4 +1,7 @@
-// mysqlfake 是一个交互式 REPL: mysqlfake [-db 文件路径]
+// mysqlfake: 交互式 REPL 或 MySQL 协议服务。
+//
+//	mysqlfake [-db 文件路径]                      本地 REPL
+//	mysqlfake serve [-db 文件路径] [-addr 地址]   启动 MySQL 协议服务 (mysql / PyMySQL 等客户端可连接)
 package main
 
 import (
@@ -6,12 +9,19 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"mysqlfake/db"
+	"mysqlfake/server"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		serve(os.Args[2:])
+		return
+	}
 	path := flag.String("db", "mysqlfake.db", "database file")
 	flag.Parse()
 	eng, err := db.Open(*path)
@@ -89,4 +99,31 @@ func splitStatements(src string) (stmts []string, rest string) {
 		}
 	}
 	return stmts, src[start:]
+}
+
+func serve(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	path := fs.String("db", "mysqlfake.db", "database file")
+	addr := fs.String("addr", "127.0.0.1:3307", "listen address")
+	mode := fs.String("mode", "auto", "I/O model: auto | eventloop | goroutine")
+	maxWorkers := fs.Int("max-workers", 64, "max concurrently executing statements")
+	maxConns := fs.Int("max-conns", 0, "max connections (0 = unlimited)")
+	fs.Parse(args)
+	eng, err := db.Open(*path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cannot open database:", err)
+		os.Exit(1)
+	}
+	srv := server.New(server.Config{Addr: *addr, Engine: eng, Mode: server.Mode(*mode), MaxWorkers: *maxWorkers, MaxConns: *maxConns})
+	if err := srv.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "cannot start server:", err)
+		eng.Close()
+		os.Exit(1)
+	}
+	fmt.Printf("mysqlfake listening on %s (%s)\n", srv.Addr(), srv.EffectiveMode())
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	srv.Close()
+	eng.Close()
 }

@@ -12,6 +12,7 @@ import (
 	"mysqlfake/sql"
 	"mysqlfake/stats"
 	"mysqlfake/tuple"
+	"mysqlfake/vector"
 )
 
 // 代价常数 (单位: 一次顺序页读取 = 1)。
@@ -37,6 +38,7 @@ type StatsProvider interface {
 type Options struct {
 	ForceJoin string // "" | "nl" | "hash" | "merge": 强制 Join 算法 (测试/提示用)
 	NoReorder bool   // 保持 FROM 的顺序 (左深)
+	RowMode   bool   // 使用行式执行器 (默认使用向量化执行器)
 }
 
 type Planner struct {
@@ -111,7 +113,15 @@ func (pl *Planner) PlanSelect(ctx *executor.Ctx, st *sql.SelectStmt) (*Plan, err
 	if err != nil {
 		return nil, err
 	}
-	ex, err := q.build(ctx, top)
+	var ex executor.Executor
+	if pl.Opts.RowMode {
+		ex, err = q.buildRow(ctx, top)
+	} else {
+		var v vector.BatchExecutor
+		if v, err = q.buildVec(ctx, top); err == nil {
+			ex = vector.NewToRows(v)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -789,7 +799,95 @@ func (q *query) bindAll(es []sql.Expr, cols []colID) (executor.Expr, error) {
 	return executor.And(bound), nil
 }
 
-func (q *query) build(ctx *executor.Ctx, n *Node) (executor.Executor, error) {
+// childRow 构建子节点的行式执行器 (向量化模式下把批执行器适配成行)。
+func (q *query) childRow(ctx *executor.Ctx, c *Node) (executor.Executor, error) {
+	if q.pl.Opts.RowMode {
+		return q.buildRow(ctx, c)
+	}
+	v, err := q.buildVec(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return vector.NewToRows(v), nil
+}
+
+func (q *query) typesOf(cols []colID) []tuple.Type {
+	out := make([]tuple.Type, len(cols))
+	for i, c := range cols {
+		out[i] = q.rels[c.rel].ti.Schema.Columns[c.col].Type
+	}
+	return out
+}
+
+// buildVec 构建向量化执行器: 扫描/过滤/哈希连接/LIMIT/投影原生向量化，其余算子 (嵌套循环、归并连接、排序)
+// 用行式实现并通过适配器接入。
+func (q *query) buildVec(ctx *executor.Ctx, n *Node) (vector.BatchExecutor, error) {
+	filter := func(child vector.BatchExecutor, es []sql.Expr, cols []colID) (vector.BatchExecutor, error) {
+		if len(es) == 0 {
+			return child, nil
+		}
+		k, err := vector.CompileAll(es, q.layoutResolver(cols))
+		if err != nil {
+			return nil, err
+		}
+		return vector.NewFilter(child, k), nil
+	}
+	switch n.Op {
+	case "SeqScan", "IndexScan":
+		var start, end []byte
+		if n.Op == "IndexScan" {
+			start, end = n.start, n.end
+		}
+		return filter(vector.NewScan(ctx, n.rel.ti, start, end), n.filters, n.cols)
+	case "Filter":
+		child, err := q.buildVec(ctx, n.Children[0])
+		if err != nil {
+			return nil, err
+		}
+		return filter(child, n.residual, n.cols)
+	case "HashJoin":
+		l, err := q.buildVec(ctx, n.Children[0])
+		if err != nil {
+			return nil, err
+		}
+		r, err := q.buildVec(ctx, n.Children[1])
+		if err != nil {
+			return nil, err
+		}
+		lc, rc := n.Children[0].cols, n.Children[1].cols
+		var lk, rk []int
+		for i := range n.lkeys {
+			lk = append(lk, indexOf(lc, n.lkeys[i]))
+			rk = append(rk, indexOf(rc, n.rkeys[i]))
+		}
+		var join vector.BatchExecutor = vector.NewHashJoin(l, r, lk, rk, q.typesOf(lc), q.typesOf(rc))
+		return filter(join, n.residual, n.cols)
+	case "Limit":
+		child, err := q.buildVec(ctx, n.Children[0])
+		if err != nil {
+			return nil, err
+		}
+		return vector.NewLimit(child, n.limit), nil
+	case "Project":
+		child, err := q.buildVec(ctx, n.Children[0])
+		if err != nil {
+			return nil, err
+		}
+		in := n.Children[0].cols
+		idx := make([]int, len(n.projCols))
+		for i, id := range n.projCols {
+			idx[i] = indexOf(in, id)
+		}
+		return vector.NewProject(child, idx), nil
+	}
+	row, err := q.buildRow(ctx, n)
+	if err != nil {
+		return nil, err
+	}
+	return vector.NewFromRows(row, q.typesOf(n.cols)), nil
+}
+
+func (q *query) buildRow(ctx *executor.Ctx, n *Node) (executor.Executor, error) {
 	switch n.Op {
 	case "SeqScan", "IndexScan":
 		var scan executor.Executor
@@ -807,7 +905,7 @@ func (q *query) build(ctx *executor.Ctx, n *Node) (executor.Executor, error) {
 		}
 		return scan, nil
 	case "Filter":
-		child, err := q.build(ctx, n.Children[0])
+		child, err := q.childRow(ctx, n.Children[0])
 		if err != nil {
 			return nil, err
 		}
@@ -817,11 +915,11 @@ func (q *query) build(ctx *executor.Ctx, n *Node) (executor.Executor, error) {
 		}
 		return executor.NewFilter(child, pred), nil
 	case "NestedLoop", "HashJoin", "MergeJoin":
-		l, err := q.build(ctx, n.Children[0])
+		l, err := q.childRow(ctx, n.Children[0])
 		if err != nil {
 			return nil, err
 		}
-		r, err := q.build(ctx, n.Children[1])
+		r, err := q.childRow(ctx, n.Children[1])
 		if err != nil {
 			return nil, err
 		}
@@ -851,19 +949,19 @@ func (q *query) build(ctx *executor.Ctx, n *Node) (executor.Executor, error) {
 			return executor.NewMergeJoin(l, r, lk, rk, resid), nil
 		}
 	case "Sort":
-		child, err := q.build(ctx, n.Children[0])
+		child, err := q.childRow(ctx, n.Children[0])
 		if err != nil {
 			return nil, err
 		}
 		return executor.NewSort(child, n.sortKeys), nil
 	case "Limit":
-		child, err := q.build(ctx, n.Children[0])
+		child, err := q.childRow(ctx, n.Children[0])
 		if err != nil {
 			return nil, err
 		}
 		return executor.NewLimit(child, n.limit), nil
 	case "Project":
-		child, err := q.build(ctx, n.Children[0])
+		child, err := q.childRow(ctx, n.Children[0])
 		if err != nil {
 			return nil, err
 		}

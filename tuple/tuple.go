@@ -262,3 +262,95 @@ func UnmarshalSchema(b []byte) (*Schema, int, error) {
 	}
 	return s, pos, nil
 }
+
+// ColBuf 是一列的列式缓冲 (向量化执行使用)。Ints/Strs 按类型二选一，Nulls 与行一一对应。
+type ColBuf struct {
+	Type  Type
+	Ints  []int64
+	Strs  []string
+	Nulls []bool
+}
+
+// Len 返回行数。
+func (c *ColBuf) Len() int { return len(c.Nulls) }
+
+// Reset 清空 (保留容量)。
+func (c *ColBuf) Reset() {
+	c.Ints, c.Strs, c.Nulls = c.Ints[:0], c.Strs[:0], c.Nulls[:0]
+}
+
+// AppendValue 追加一个值。
+func (c *ColBuf) AppendValue(v Value) {
+	c.Nulls = append(c.Nulls, v.Null)
+	if c.Type == TypeInt {
+		c.Ints = append(c.Ints, v.Int)
+	} else {
+		c.Strs = append(c.Strs, v.Str)
+	}
+}
+
+// Value 取第 i 行的值。
+func (c *ColBuf) Value(i int) Value {
+	if c.Nulls[i] {
+		return NullValue(c.Type)
+	}
+	if c.Type == TypeInt {
+		return IntValue(c.Ints[i])
+	}
+	return StrValue(c.Strs[i])
+}
+
+// AppendFrom 把 src 的第 i 行追加到 c。
+func (c *ColBuf) AppendFrom(src *ColBuf, i int) {
+	c.Nulls = append(c.Nulls, src.Nulls[i])
+	if c.Type == TypeInt {
+		c.Ints = append(c.Ints, src.Ints[i])
+	} else {
+		c.Strs = append(c.Strs, src.Strs[i])
+	}
+}
+
+// UnmarshalColumns 把一行直接解码并追加到各列缓冲 (不创建 Value 对象)。cols 与 schema 列一一对应。
+func UnmarshalColumns(s *Schema, b []byte, cols []ColBuf) error {
+	n := len(s.Columns)
+	bm := (n + 7) / 8
+	if len(b) < bm {
+		return ErrCorrupt
+	}
+	pos := bm
+	for i, c := range s.Columns {
+		col := &cols[i]
+		if b[i/8]&(1<<(i%8)) != 0 {
+			col.Nulls = append(col.Nulls, true)
+			if c.Type == TypeInt {
+				col.Ints = append(col.Ints, 0)
+			} else {
+				col.Strs = append(col.Strs, "")
+			}
+			continue
+		}
+		col.Nulls = append(col.Nulls, false)
+		switch c.Type {
+		case TypeInt:
+			if pos+8 > len(b) {
+				return ErrCorrupt
+			}
+			col.Ints = append(col.Ints, int64(binary.LittleEndian.Uint64(b[pos:])))
+			pos += 8
+		case TypeVarchar:
+			if pos+2 > len(b) {
+				return ErrCorrupt
+			}
+			l := int(binary.LittleEndian.Uint16(b[pos:]))
+			pos += 2
+			if pos+l > len(b) {
+				return ErrCorrupt
+			}
+			col.Strs = append(col.Strs, string(b[pos:pos+l]))
+			pos += l
+		default:
+			return ErrCorrupt
+		}
+	}
+	return nil
+}

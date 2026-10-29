@@ -71,23 +71,33 @@ func lex(src string) ([]token, error) {
 			}
 			toks = append(toks, token{tInt, src[i:j], i})
 			i = j
-		case c == '\'':
+		case c == '\'' || c == '"':
+			// 字符串字面量: 支持引号加倍 ('' / "") 和 MySQL 的反斜杠转义
+			quote := c
 			var sb strings.Builder
 			j := i + 1
 			closed := false
 			for j < len(src) {
-				if src[j] == '\'' {
-					if j+1 < len(src) && src[j+1] == '\'' { // '' 转义
-						sb.WriteByte('\'')
+				ch := src[j]
+				switch {
+				case ch == quote:
+					if j+1 < len(src) && src[j+1] == quote {
+						sb.WriteByte(quote)
 						j += 2
 						continue
 					}
 					closed = true
 					j++
-					break
+				case ch == '\\' && j+1 < len(src):
+					sb.WriteByte(unescape(src[j+1]))
+					j += 2
+					continue
+				default:
+					sb.WriteByte(ch)
+					j++
+					continue
 				}
-				sb.WriteByte(src[j])
-				j++
+				break
 			}
 			if !closed {
 				return nil, fmt.Errorf("syntax error at %d: unterminated string", i)
@@ -122,3 +132,22 @@ func lex(src string) ([]token, error) {
 
 func isAlpha(c byte) bool { return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// unescape 返回反斜杠转义序列 \x 对应的字节 (未知转义保持字符本身，与 MySQL 一致)。
+func unescape(c byte) byte {
+	switch c {
+	case 'n':
+		return '\n'
+	case 't':
+		return '\t'
+	case 'r':
+		return '\r'
+	case '0':
+		return 0
+	case 'b':
+		return '\b'
+	case 'Z':
+		return 26
+	}
+	return c
+}

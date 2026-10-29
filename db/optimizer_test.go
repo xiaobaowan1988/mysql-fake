@@ -124,7 +124,13 @@ func TestOptimizerRandomQueriesAgreeWithBaseline(t *testing.T) {
 	mustExec(t, e, "ANALYZE TABLE ta")
 	mustExec(t, e, "ANALYZE TABLE tb")
 	// tc 故意不分析: 无统计信息的路径 (ensureStats 会补)
-	configs := []optimizer.Options{{ForceJoin: "hash"}, {ForceJoin: "merge"}, {ForceJoin: "nl"}, {}, {NoReorder: true}}
+	var configs []optimizer.Options
+	for _, rowMode := range []bool{false, true} { // 向量化与行式两种执行模式都要与基线一致
+		for _, c := range []optimizer.Options{{ForceJoin: "hash"}, {ForceJoin: "merge"}, {ForceJoin: "nl"}, {}, {NoReorder: true}} {
+			c.RowMode = rowMode
+			configs = append(configs, c)
+		}
+	}
 	tables := []string{"ta", "tb", "tc"}
 	for round := 0; round < 120; round++ {
 		n := 2 + rng.Intn(2)
@@ -162,7 +168,7 @@ func TestOptimizerRandomQueriesAgreeWithBaseline(t *testing.T) {
 		if len(conds) > 0 {
 			q += " WHERE " + strings.Join(conds, " AND ")
 		}
-		e.SetPlannerOptions(optimizer.Options{ForceJoin: "nl", NoReorder: true})
+		e.SetPlannerOptions(optimizer.Options{ForceJoin: "nl", NoReorder: true, RowMode: true}) // 最朴素的行式计划作为基线
 		base := rowSet(mustExec(t, e, q))
 		for _, cfg := range configs {
 			e.SetPlannerOptions(cfg)

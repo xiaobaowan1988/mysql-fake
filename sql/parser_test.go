@@ -153,3 +153,30 @@ func TestParseJoinOrderLimitExplain(t *testing.T) {
 		}
 	}
 }
+
+func TestStringEscapes(t *testing.T) {
+	cases := map[string]string{
+		`'it\'s'`:      "it's",
+		`'a\\b'`:       `a\b`,
+		`'line\nnext'`: "line\nnext",
+		`'tab\there'`:  "tab\there",
+		`"dq \"x\""`:   `dq "x"`,
+		`'dbl''quote'`: "dbl'quote",
+		`'unk\qesc'`:   "unkqesc",
+		`'nul\0z'`:     "nul\x00z",
+		`'bö'`:         "bö",
+	}
+	for lit, want := range cases {
+		st, err := Parse("INSERT INTO t VALUES (" + lit + ")")
+		if err != nil {
+			t.Errorf("%s: %v", lit, err)
+			continue
+		}
+		if got := st.(*InsertStmt).Rows[0][0].(*Literal).Value.Str; got != want {
+			t.Errorf("%s: got %q want %q", lit, got, want)
+		}
+	}
+	if _, err := Parse(`INSERT INTO t VALUES ('abc\')`); err == nil {
+		t.Error("escaped closing quote must leave the string unterminated")
+	}
+}

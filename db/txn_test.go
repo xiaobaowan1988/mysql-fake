@@ -320,20 +320,25 @@ func TestDeadlockVictimRolledBack(t *testing.T) {
 	}
 }
 
-func TestDDLInsideTxnRejected(t *testing.T) {
+func TestDDLImplicitlyCommits(t *testing.T) {
 	e := newEngine(t)
+	mustExec(t, e, "CREATE TABLE x (a INT PRIMARY KEY)")
 	s := e.NewSession()
 	sexec(t, s, "BEGIN")
-	if _, err := s.Exec("CREATE TABLE x (a INT PRIMARY KEY)"); err == nil {
-		t.Fatal("expected error")
+	sexec(t, s, "INSERT INTO x VALUES (1)")
+	sexec(t, s, "CREATE TABLE y (a INT PRIMARY KEY)") // 隐式提交 INSERT
+	if s.InTxn() {
+		t.Fatal("DDL must end the transaction")
 	}
-	sexec(t, s, "COMMIT")
-	sexec(t, s, "CREATE TABLE x (a INT PRIMARY KEY)")
+	sexec(t, s, "ROLLBACK") // 已无事务，空操作
+	if r := mustExec(t, e, "SELECT * FROM x"); len(r.Rows) != 1 {
+		t.Fatal("DDL must have committed the insert")
+	}
 	// 会话关闭时回滚未提交事务
 	sexec(t, s, "BEGIN")
-	sexec(t, s, "INSERT INTO x VALUES (1)")
+	sexec(t, s, "INSERT INTO x VALUES (2)")
 	s.Close()
-	if r := mustExec(t, e, "SELECT * FROM x"); len(r.Rows) != 0 {
+	if r := mustExec(t, e, "SELECT * FROM x"); len(r.Rows) != 1 {
 		t.Fatal("Close must roll back")
 	}
 }
