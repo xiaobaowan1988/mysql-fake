@@ -183,3 +183,39 @@
   - [x] 实现 Slow Query Log (慢查询日志) 与执行耗时细粒度 Profiling
 - 已知限制: `ADD COLUMN ... DEFAULT` 只用于回填已有行，之后的 INSERT 未指定该列时为 NULL；二级索引项不清理 (无 purge)；热备份结束阶段会短暂静默写事务 (等待已写入的事务结束，最长 30 秒，否则备份失败)；Profile 的 Plan 耗时只统计 SELECT/EXPLAIN；无 DROP INDEX/DROP COLUMN；备份期间 WAL 不截断，磁盘占用上升；PITR 目标点之前的备份必须存在；
   Online DDL 切换时刻之前开启的快照事务，切换后会读到切换时刻的数据 (不保持其快照)；集群里 DDL 复制失败时只能在 X 锁内撤销。
+
+## Phase 10: 崩溃恢复完善 —— 回滚未提交事务 (ARIES 式 Analysis / Redo / Undo)
+- 背景: Phase 3 的恢复只做 redo，且无条件重放全部 Update 记录 (页更新日志的 TxnID 记 0，缓冲池不知道事务)，Phase 4 的 Undo Log 只在内存里。
+  结果: 崩溃时已经写出日志、但没有提交的事务，其修改会留在数据里 (见 `db/undo_recovery_test.go`)。本阶段补上 Undo 阶段，消除这条已知限制。
+- 设计: 恢复分三个阶段。Analysis: 顺序扫描日志找出"失败者"；Redo: 沿用现有逻辑，重放**全部**历史 (含失败者的修改，页 LSN 保证幂等)，使页回到崩溃瞬间的样子；
+  Undo: 按 LSN 倒序撤销失败者的修改。先重做再撤销，是为了让 Undo 面对的永远是一个一致的现场。
+- 设计: Undo 信息持久化。新增日志类型 `RecUndo`，由 `Txn.AddUndo` 在修改数据**之前**写入日志，内容为 `{TxnID, Kind, 主键树根页号, Key, OldValue, IdxAdds[(索引树根页号, Key)]}`。
+  按 WAL 规则，任何已落盘的页修改，其 `RecUndo` 一定先于它落盘 (页刷盘前必须先把日志刷到页 LSN，而 `RecUndo` 的 LSN 更小)。
+  `txn.Logger` 增加写 Undo 记录的方法；内存 `UndoLog` 保留 (MVCC 版本链与运行期回滚仍然使用它)。树用**根页号**标识 (Phase 1 起根页号固定不变)，恢复时 `btree.Open(pool, root)` 即可，不依赖 Catalog。
+- 设计: 必须是**逻辑** Undo，不能用 Update 记录里的 Before 镜像做物理撤销: Before 是页内字节区间，同一页上别的事务之后可能插入键、导致字节整体移动或页分裂，
+  把旧字节写回原偏移会破坏页。行锁保护的是行，不是页内字节位置。因此撤销 = 对 B+ 树执行 `Put(Key, OldValue)` / `Delete(Key)`，并删除 `IdxAdds` 中本次新增的索引项。
+- 设计: Analysis 规则: 出现 `RecUndo` 的事务进入活跃表；遇到该事务的 `RecCommit` 或 `RecAbort` 则移出；扫描结束仍在表中的就是失败者。
+  已有 `RecAbort` 的事务不再撤销: 回滚过程对 B+ 树的修改也走缓冲池并记了日志，重做历史即得到回滚后的状态。`Abort` 记录不强制刷盘；若它丢失而回滚的页修改已落盘，该事务会被当作失败者再撤销一遍，结果相同 (见下条)。
+- 设计: 撤销操作都是"绝对值"写入 (写回旧值 / 删除键)，按倒序把整个撤销列表完整执行一遍，每个键的最后一次写入来自它最早的 undo 记录，因此重复执行是幂等的；失败者持有的行锁直到崩溃都未释放，没有其他事务能改同一个键，所以不会与别的事务的修改交错。
+  恢复可重启: Undo 期间再次崩溃，失败者仍没有 `RecAbort`，下次恢复从头再撤销。全部撤销完成并落盘后才为每个失败者写 `RecAbort`。
+- 设计: 恢复入口调整。`wal.Recover` 只做 Analysis + Redo，**不再截断日志**，返回失败者及其 undo 记录 (倒序)；`Engine.Open` 在 `catalog.Open` 之后执行 Undo (撤销期间的页修改同样记日志)，写 `RecAbort`、`FlushAll`，
+  最后沿用 `Open` 里已有的 Checkpoint 截断日志。
+- 设计: 日志截断下界。Fuzzy 与 Sharp Checkpoint 当前都会丢弃日志前缀，若此时有活跃的写事务，它的 `RecUndo` 会被丢掉，而它修改过的脏页已刷盘，崩溃后就无法撤销。
+  `txn.Manager` 记录每个写事务的第一条 `RecUndo` 的 LSN，缓冲池的截断点取 `min(原截断点, 所有活跃写事务的最小 firstUndoLSN)`；保留下来的旧日志重放时由页 LSN 跳过。
+  优雅关闭 (`Engine.Close`) 时仍有打开的事务: 与崩溃走同一条路径，Checkpoint 保留这些事务的日志，下次 `Open` 撤销。
+- 设计: 范围与不变项。热备份的写入静默 (`Quiesce`) 保持不变 (不再是正确性所必需，但仍使备份内容更干净)；DDL 不产生 undo 记录，崩溃发生在 DDL 期间的行为不变；
+  从节点应用复制日志同样经过 `txn.Manager`，自动获得此能力；Raft 日志与 Binlog 只在提交时生成，失败者不会出现在其中。
+- 测试: `db/undo_recovery_test.go`，验收场景见各测试注释。未实现的步骤用 `pending()` 标记，默认跳过，`MYFAKE_PENDING=1` 强制运行 (用于确认它们现在失败)；完成对应步骤时删除标记。
+- [ ] **10.1 Undo 日志持久化与 Analysis**
+  - [ ] 新增 `RecUndo` 日志记录 (编码/解码/恢复读取)，`Txn.AddUndo` 先写日志
+  - [ ] Analysis: 从日志找出失败者及其 undo 记录
+- [ ] **10.2 Undo 阶段**
+  - [ ] `wal.Recover` 只做 Analysis + Redo 且不截断；`Engine.Open` 在 Catalog 就绪后逻辑撤销失败者 (含二级索引项)，写 `RecAbort` 后 Checkpoint
+- [ ] **10.3 检查点与关闭的联动**
+  - [ ] 记录 firstUndoLSN，Fuzzy/Sharp Checkpoint 的截断点不越过活跃写事务的 undo 记录；优雅关闭保留未结束事务的日志
+- [ ] **10.4 可重启与压力测试，并更新旧限制**
+  - [ ] Undo 期间崩溃可重启的测试 (需要在撤销过程中注入崩溃的钩子)；多事务并发 + 随机崩溃的不变量测试 (转账总额)
+  - [ ] 更新 Phase 3 / 4 / 5 / 8 / 9 中"崩溃时未提交事务不回滚"的已知限制措辞
+- 已知限制 (完成后仍然存在): 没有 CLR (补偿日志记录)，撤销期间再崩溃要从头再撤销一遍而不是接着上次的进度；Undo 信息是逻辑记录，每次修改多写一条日志 (写放大)；
+  DDL 期间崩溃仍可能泄漏页或留下半成品；`Commit` 时 Binlog 已追加而 WAL 提交记录尚未落盘就崩溃，该事务在 Binlog 里存在、数据却被撤销 (与 MySQL 的 binlog/redo 两阶段提交问题同类，不处理)；
+  不实现 Savepoint 嵌套和 Nested Top Action，B+ 树分裂等结构修改的原子性仍不保证 (Phase 3 已知限制)。
