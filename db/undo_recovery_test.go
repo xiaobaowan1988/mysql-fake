@@ -127,7 +127,6 @@ func TestUndoRecovery_SecondaryIndexEntriesUndone(t *testing.T) {
 
 // 检查点把失败者修改过的脏页刷盘，并丢弃日志前缀: 如果 undo 信息随之被丢掉，就再也撤销不了了。
 func TestUndoRecovery_SurvivesFuzzyCheckpoint(t *testing.T) {
-	pending(t, "10.3")
 	path := filepath.Join(t.TempDir(), "undo4.db")
 	e := openRecoveryEngine(t, path)
 	setupAccounts(t, e)
@@ -150,7 +149,6 @@ func TestUndoRecovery_SurvivesFuzzyCheckpoint(t *testing.T) {
 
 // 优雅关闭时还有打开的事务: Close 会做 Checkpoint (刷全部脏页并截断日志)，同样不能丢掉 undo 信息。
 func TestUndoRecovery_GracefulCloseWithOpenTxn(t *testing.T) {
-	pending(t, "10.3")
 	path := filepath.Join(t.TempDir(), "undo5.db")
 	e := openRecoveryEngine(t, path)
 	setupAccounts(t, e)
@@ -209,5 +207,46 @@ func TestUndoLogged_LoserIsFoundByAnalysis(t *testing.T) {
 	}
 	if want := []uint8{uint8(txn.UndoUpdate), uint8(txn.UndoDelete), uint8(txn.UndoInsert)}; !reflect.DeepEqual(kinds, want) {
 		t.Fatalf("undo kinds in log order = %v, want %v", kinds, want)
+	}
+}
+
+// 日志截断的下界只约束"活跃的写事务": 事务提交/回滚之后检查点必须能把它的日志整个丢掉，否则日志会无限增长。
+func TestUndoFloorReleasedWhenTxnEnds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "undo6.db")
+	e := openRecoveryEngine(t, path)
+	defer e.Close()
+	setupAccounts(t, e)
+
+	s := e.NewSession()
+	sexec(t, s, "BEGIN")
+	sexec(t, s, "UPDATE acc SET bal = 0 WHERE id = 1")
+	if err := e.pool.Checkpoint(); err != nil { // 事务还活着: 它的 Undo 记录必须留在日志里
+		t.Fatal(err)
+	}
+	recs, err := wal.ReadFile(path + ".wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ls := wal.Analyze(recs); len(ls) != 1 || len(ls[0].Undos) != 1 {
+		t.Fatalf("an active txn's undo record must survive a checkpoint, analysis found %+v", ls)
+	}
+
+	sexec(t, s, "COMMIT")
+	if err := e.pool.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if recs, _ = wal.ReadFile(path + ".wal"); len(recs) != 0 {
+		t.Fatalf("after the txn committed the checkpoint must empty the log, %d records left", len(recs))
+	}
+
+	// 回滚同理
+	sexec(t, s, "BEGIN")
+	sexec(t, s, "UPDATE acc SET bal = 5 WHERE id = 1")
+	sexec(t, s, "ROLLBACK")
+	if err := e.pool.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if recs, _ = wal.ReadFile(path + ".wal"); len(recs) != 0 {
+		t.Fatalf("after the txn rolled back the checkpoint must empty the log, %d records left", len(recs))
 	}
 }

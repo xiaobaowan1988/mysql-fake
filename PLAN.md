@@ -201,7 +201,9 @@
 - 设计: 恢复入口调整。`wal.Recover` 只做 Analysis + Redo，**不再截断日志**，返回失败者及其 undo 记录 (倒序)；`Engine.Open` 在 `catalog.Open` 之后执行 Undo (撤销期间的页修改同样记日志)，写 `RecAbort`、`FlushAll`，
   最后沿用 `Open` 里已有的 Checkpoint 截断日志。
 - 设计: 日志截断下界。Fuzzy 与 Sharp Checkpoint 当前都会丢弃日志前缀，若此时有活跃的写事务，它的 `RecUndo` 会被丢掉，而它修改过的脏页已刷盘，崩溃后就无法撤销。
-  `txn.Manager` 记录每个写事务的第一条 `RecUndo` 的 LSN，缓冲池的截断点取 `min(原截断点, 所有活跃写事务的最小 firstUndoLSN)`；保留下来的旧日志重放时由页 LSN 跳过。
+  由 `wal.LogManager` 记录每个写事务的第一条 `RecUndo` 的 LSN (`AppendUndo` 在追加日志的同一把锁内登记，`Pool.Commit`/`Pool.Abort` 追加结束记录后调用 `EndTxn` 释放)，
+  `Truncate` (Sharp) 与 `TruncateBefore` (Fuzzy) 在持有同一把锁时把截断点取为 `min(原截断点, 所有活跃写事务的最小 firstUndoLSN)`；保留下来的旧日志重放时由页 LSN 跳过。
+  放在 `LogManager` 而不是 `txn.Manager`，是因为"登记下界"必须与"追加 undo 记录"原子完成，也必须与"计算截断点"互斥: 否则检查点可能恰好落在追加 undo 记录之后、登记下界之前，把刚写的 undo 记录截掉。
   优雅关闭 (`Engine.Close`) 时仍有打开的事务: 与崩溃走同一条路径，Checkpoint 保留这些事务的日志，下次 `Open` 撤销。
 - 设计: 范围与不变项。热备份的写入静默 (`Quiesce`) 保持不变 (不再是正确性所必需，但仍使备份内容更干净)；DDL 不产生 undo 记录，崩溃发生在 DDL 期间的行为不变；
   从节点应用复制日志同样经过 `txn.Manager`，自动获得此能力；Raft 日志与 Binlog 只在提交时生成，失败者不会出现在其中。
@@ -214,8 +216,8 @@
   - [x] Analysis: 从日志找出失败者及其 undo 记录
 - [x] **10.2 Undo 阶段**
   - [x] `wal.Recover` 只做 Redo 且不截断 (Analysis 由 `wal.Analyze` 在它之前完成)；`Engine.Open` 在 Catalog 就绪后逻辑撤销失败者 (含二级索引项)，写 `RecAbort` 并刷日志后 Checkpoint
-- [ ] **10.3 检查点与关闭的联动**
-  - [ ] 记录 firstUndoLSN，Fuzzy/Sharp Checkpoint 的截断点不越过活跃写事务的 undo 记录；优雅关闭保留未结束事务的日志
+- [x] **10.3 检查点与关闭的联动**
+  - [x] 记录 firstUndoLSN，Fuzzy/Sharp Checkpoint 的截断点不越过活跃写事务的 undo 记录；优雅关闭保留未结束事务的日志
 - [ ] **10.4 可重启与压力测试，并更新旧限制**
   - [ ] Undo 期间崩溃可重启的测试 (需要在撤销过程中注入崩溃的钩子)；多事务并发 + 随机崩溃的不变量测试 (转账总额)
   - [ ] 更新 Phase 3 / 4 / 5 / 8 / 9 中"崩溃时未提交事务不回滚"的已知限制措辞

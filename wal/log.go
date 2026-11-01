@@ -217,6 +217,10 @@ type LogManager struct {
 	nextLSN    uint64
 	flushedLSN uint64
 	recovered  []Record // 打开时读到的有效记录
+
+	// 每个仍在运行的写事务的第一条 Undo 记录的 LSN。截断日志时不能越过其中最小的那个:
+	// 这些事务一旦在崩溃时没有结束，恢复需要用这些 Undo 记录撤销它们。
+	firstUndo map[uint64]uint64
 }
 
 // Open 打开 (或创建) 日志文件，读取全部有效记录并截掉损坏的尾部。
@@ -225,7 +229,7 @@ func Open(path string) (*LogManager, error) {
 	if err != nil {
 		return nil, err
 	}
-	lm := &LogManager{f: f, path: path}
+	lm := &LogManager{f: f, path: path, firstUndo: map[uint64]uint64{}}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
@@ -299,6 +303,10 @@ func (lm *LogManager) Records() []Record { return lm.recovered }
 func (lm *LogManager) Append(r *Record) uint64 {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
+	return lm.appendLocked(r)
+}
+
+func (lm *LogManager) appendLocked(r *Record) uint64 {
 	r.LSN = lm.nextLSN
 	lm.nextLSN++
 	lm.buf = append(lm.buf, r.encode()...)
@@ -306,9 +314,33 @@ func (lm *LogManager) Append(r *Record) uint64 {
 }
 
 // AppendUndo 追加一条 Undo 记录 (r.Type 被设为 RecUndo)。调用方必须在修改数据页之前调用 (WAL 规则)。
+// 同一把锁内登记该事务的第一条 Undo 记录的 LSN: 之后的任何日志截断都不会越过它，直到 EndTxn。
 func (lm *LogManager) AppendUndo(r *Record) uint64 {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
 	r.Type = RecUndo
-	return lm.Append(r)
+	lsn := lm.appendLocked(r)
+	if _, ok := lm.firstUndo[r.TxnID]; !ok {
+		lm.firstUndo[r.TxnID] = lsn
+	}
+	return lsn
+}
+
+// EndTxn 在事务的 Commit/Abort 记录追加之后调用，解除它对日志截断的约束。
+func (lm *LogManager) EndTxn(txnID uint64) {
+	lm.mu.Lock()
+	delete(lm.firstUndo, txnID)
+	lm.mu.Unlock()
+}
+
+// undoFloorLocked 返回所有活跃写事务中最小的 firstUndo LSN；没有活跃写事务时 ok 为 false。
+func (lm *LogManager) undoFloorLocked() (floor uint64, ok bool) {
+	for _, l := range lm.firstUndo {
+		if !ok || l < floor {
+			floor, ok = l, true
+		}
+	}
+	return
 }
 
 // Flush 保证 LSN <= upTo 的记录已 fsync 落盘。
@@ -360,11 +392,16 @@ func (lm *LogManager) NextLSN() uint64 {
 }
 
 // Truncate 清空日志 (调用方必须保证所有脏页已刷盘)。LSN 继续递增。
+// 如果还有活跃的写事务，则保留从它们最早的 Undo 记录开始的全部日志 (其余照常丢弃)。
 func (lm *LogManager) Truncate() error {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
-	lm.buf = lm.buf[:0]
 	lm.recovered = nil
+	if floor, ok := lm.undoFloorLocked(); ok {
+		_, err := lm.truncateBeforeLocked(floor)
+		return err
+	}
+	lm.buf = lm.buf[:0]
 	return lm.resetFile()
 }
 
@@ -380,10 +417,17 @@ func (lm *LogManager) Size() int64 {
 }
 
 // TruncateBefore 丢弃 LSN 小于 lsn 的日志前缀 (Fuzzy Checkpoint 使用)，保留其余记录。
-// 通过写临时文件再原子替换实现。返回丢弃的记录数。
+// 截断点不会越过活跃写事务的第一条 Undo 记录。通过写临时文件再原子替换实现。返回丢弃的记录数。
 func (lm *LogManager) TruncateBefore(lsn uint64) (int, error) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
+	if floor, ok := lm.undoFloorLocked(); ok && floor < lsn {
+		lsn = floor
+	}
+	return lm.truncateBeforeLocked(lsn)
+}
+
+func (lm *LogManager) truncateBeforeLocked(lsn uint64) (int, error) {
 	if err := lm.flushLocked(); err != nil {
 		return 0, err
 	}

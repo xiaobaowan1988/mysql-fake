@@ -131,3 +131,104 @@ func TestAnalyze(t *testing.T) {
 		t.Fatalf("PendingUndos must be in descending LSN order, got %v", lsns)
 	}
 }
+
+func lsnsOf(recs []Record) []uint64 {
+	var out []uint64
+	for _, r := range recs {
+		out = append(out, r.LSN)
+	}
+	return out
+}
+
+func upd(lm *LogManager, n int) {
+	for i := 0; i < n; i++ {
+		lm.Append(&Record{Type: RecUpdate, PageID: 1, Before: []byte("a"), After: []byte("b")})
+	}
+}
+
+// 活跃写事务的 Undo 记录 (及其之后的全部日志) 不能被 Fuzzy Checkpoint 的截断丢掉；事务结束后才能丢。
+func TestTruncateBeforeKeepsActiveTxnUndo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f.wal")
+	lm, _ := Open(path)
+	upd(lm, 3)                                                                                         // LSN 1..3
+	lm.AppendUndo(&Record{TxnID: 7, After: (&UndoInfo{Kind: 2, Root: 1, Key: []byte("k")}).Marshal()}) // LSN 4: 事务 7 的第一条
+	upd(lm, 2)                                                                                         // LSN 5..6
+	lm.AppendUndo(&Record{TxnID: 7, After: (&UndoInfo{Kind: 2, Root: 1, Key: []byte("k")}).Marshal()}) // LSN 7: 同一事务的第二条，不改变下界
+
+	n, err := lm.TruncateBefore(100) // 请求丢掉全部
+	if err != nil || n != 3 {
+		t.Fatalf("dropped %d (err %v), want 3: LSN 1..3 only", n, err)
+	}
+	recs, _ := ReadFile(path)
+	if got := lsnsOf(recs); !reflect.DeepEqual(got, []uint64{4, 5, 6, 7}) {
+		t.Fatalf("kept %v, want [4 5 6 7]", got)
+	}
+	if ls := Analyze(recs); len(ls) != 1 || ls[0].TxnID != 7 || len(ls[0].Undos) != 2 {
+		t.Fatalf("the active txn must still be recoverable as a loser after truncation: %+v", ls)
+	}
+
+	lm.Append(&Record{Type: RecCommit, TxnID: 7})
+	lm.EndTxn(7)
+	if _, err := lm.TruncateBefore(100); err != nil {
+		t.Fatal(err)
+	}
+	recs, _ = ReadFile(path)
+	if len(recs) != 0 {
+		t.Fatalf("after the txn ended everything should be droppable, kept %v", lsnsOf(recs))
+	}
+	lm.Close()
+}
+
+// 下界取所有活跃写事务中最小的那个；最早的事务结束后，下界前移。
+func TestUndoFloorIsMinimumOverActiveTxns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.wal")
+	lm, _ := Open(path)
+	u := (&UndoInfo{Kind: 1, Root: 1, Key: []byte("k")}).Marshal()
+	upd(lm, 1)                                  // 1
+	lm.AppendUndo(&Record{TxnID: 20, After: u}) // 2
+	upd(lm, 1)                                  // 3
+	lm.AppendUndo(&Record{TxnID: 10, After: u}) // 4
+	lm.AppendUndo(&Record{TxnID: 20, After: u}) // 5
+	lm.TruncateBefore(100)
+	recs, _ := ReadFile(path)
+	if got := lsnsOf(recs); got[0] != 2 {
+		t.Fatalf("floor must be txn 20's first undo (LSN 2), kept %v", got)
+	}
+	lm.Append(&Record{Type: RecCommit, TxnID: 20})
+	lm.EndTxn(20)
+	lm.TruncateBefore(100)
+	recs, _ = ReadFile(path)
+	if got := lsnsOf(recs); got[0] != 4 {
+		t.Fatalf("after txn 20 ended the floor must move to txn 10's first undo (LSN 4), kept %v", got)
+	}
+	lm.Close()
+}
+
+// Sharp Checkpoint 的 Truncate: 没有活跃写事务时清空；有活跃写事务时保留它们的日志，
+// 并且缓冲区里尚未落盘的记录不能被丢掉。
+func TestTruncateKeepsActiveTxnUndoAndUnflushedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.wal")
+	lm, _ := Open(path)
+	upd(lm, 2)                                                                                         // 1..2
+	lm.AppendUndo(&Record{TxnID: 5, After: (&UndoInfo{Kind: 1, Root: 1, Key: []byte("k")}).Marshal()}) // 3
+	upd(lm, 1)                                                                                         // 4: 留在缓冲区里，没有 Flush
+	if err := lm.Truncate(); err != nil {
+		t.Fatal(err)
+	}
+	recs, _ := ReadFile(path)
+	if got := lsnsOf(recs); !reflect.DeepEqual(got, []uint64{3, 4}) {
+		t.Fatalf("kept %v, want [3 4] (undo record and the unflushed record after it)", got)
+	}
+	lm.Append(&Record{Type: RecAbort, TxnID: 5})
+	lm.EndTxn(5)
+	if err := lm.Truncate(); err != nil {
+		t.Fatal(err)
+	}
+	if recs, _ = ReadFile(path); len(recs) != 0 {
+		t.Fatalf("no active txn: log must be empty, got %v", lsnsOf(recs))
+	}
+	if lm.NextLSN() != 6 { // 1..4 加上 Abort 的 5
+		t.Fatalf("LSNs must keep increasing across truncation, next=%d", lm.NextLSN())
+	}
+	lm.Close()
+}

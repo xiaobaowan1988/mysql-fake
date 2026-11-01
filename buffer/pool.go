@@ -307,6 +307,7 @@ func (p *Pool) FreePage(id storage.PageID) error {
 // Commit 写入提交记录并强制日志落盘 (持久性)。
 func (p *Pool) Commit(txnID uint64) error {
 	lsn := p.log.Append(&wal.Record{Type: wal.RecCommit, TxnID: txnID})
+	p.log.EndTxn(txnID) // 结束记录已在日志里，不再需要为它保留 Undo 记录
 	return p.log.Flush(lsn)
 }
 
@@ -376,6 +377,7 @@ func (p *Pool) LogUndo(txnID uint64, info wal.UndoInfo) uint64 {
 // Abort 写入回滚记录 (不需要立即刷盘)。
 func (p *Pool) Abort(txnID uint64) {
 	p.log.Append(&wal.Record{Type: wal.RecAbort, TxnID: txnID})
+	p.log.EndTxn(txnID)
 }
 
 // HoldLogTruncation 暂停 WAL 截断 (热备份期间需要保留自备份起点以来的全部日志)。返回恢复函数。
