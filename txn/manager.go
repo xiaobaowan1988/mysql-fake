@@ -65,7 +65,10 @@ func (m *Manager) SetReplicator(f ReplicateFunc) {
 }
 
 // Subscribe 订阅已提交事务的行事件 (Online DDL 的增量捕获使用)。回调在提交线程内同步执行，
-// 此时事务仍持有锁。返回取消订阅函数。
+// 此时事务已提交 (日志已落盘)、已离开活跃集合，但仍持有锁。返回取消订阅函数。
+//
+// 保证: 任何事务，要么在 Subscribe 返回之后才通知 (回调会收到它)，要么在 Subscribe 之前就已离开活跃集合
+// (Subscribe 之后建立的 Read View 看得到它的修改)。订阅后立刻做快照拷贝再回放事件，就不会丢失写入。
 func (m *Manager) Subscribe(f func(*binlog.Txn)) (cancel func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -158,6 +161,7 @@ type Txn struct {
 	view            *ReadView
 	wrote           bool
 	done            bool
+	pendingNotify   *binlog.Txn // 提交成功后要通知订阅者的行事件
 }
 
 func (m *Manager) Begin() (*Txn, error) {
@@ -295,8 +299,9 @@ func (t *Txn) Commit() error {
 	if t.done {
 		return ErrTxnFinished
 	}
+	var rec *binlog.Txn
 	if events := append(append([]binlog.Event(nil), t.evs...), t.ddl...); len(events) > 0 {
-		rec := &binlog.Txn{TxnID: t.ID, TimeNano: time.Now().UnixNano(), Events: events}
+		rec = &binlog.Txn{TxnID: t.ID, TimeNano: time.Now().UnixNano(), Events: events}
 		m := t.mgr
 		m.mu.Lock()
 		rep := m.replicator
@@ -313,7 +318,6 @@ func (t *Txn) Commit() error {
 				return err
 			}
 		}
-		m.notify(rec)
 	}
 	var err error
 	if t.wrote {
@@ -323,6 +327,9 @@ func (t *Txn) Commit() error {
 		err = t.onCommit()
 	}
 	metrics.TxnCommits.Inc()
+	if err == nil {
+		t.pendingNotify = rec // 在 finish 里、事务离开活跃集合之后通知订阅者
+	}
 	t.finish()
 	return err
 }
@@ -368,6 +375,13 @@ func (t *Txn) finish() {
 		m.gate.Broadcast()
 	}
 	m.mu.Unlock()
+	// 先离开活跃集合、再通知订阅者、最后释放锁。顺序很重要 (Online DDL 依赖它):
+	// 订阅之前已经通知过的事务，在通知时就已不在活跃集合里，之后建立的 Read View 一定能看到它的修改；
+	// 订阅之后才通知的事务，其事件会被订阅者收到。两种情况都不会漏掉。
+	if t.pendingNotify != nil {
+		m.notify(t.pendingNotify)
+		t.pendingNotify = nil
+	}
 	m.Locks.ReleaseAll(t.ID)
 	if idle {
 		m.purgeIfIdle()
