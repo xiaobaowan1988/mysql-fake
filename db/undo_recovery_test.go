@@ -40,7 +40,6 @@ func queryRows(t *testing.T, e *Engine, q string) string {
 // 场景: 失败者先改了数据 (没有提交)，之后另一个事务提交——Commit 会把整个 WAL 缓冲 (含失败者的记录)
 // 一起 fsync，所以崩溃后日志里有失败者的修改。恢复必须撤销它们，同时保留赢家的提交。
 func TestUndoRecovery_LoserRolledBack(t *testing.T) {
-	pending(t, "10.2")
 	path := filepath.Join(t.TempDir(), "undo1.db")
 	e := openRecoveryEngine(t, path)
 	setupAccounts(t, e) // (1,100,'a') (2,200,'b') (3,300,'c')，已提交
@@ -59,6 +58,9 @@ func TestUndoRecovery_LoserRolledBack(t *testing.T) {
 
 	e = openRecoveryEngine(t, path)
 	defer e.Close()
+	if st := e.RecoveryStats(); st.Losers != 1 || st.Undone != 3 || st.Redone == 0 {
+		t.Fatalf("recovery stats = %+v, want 1 loser, 3 undo records applied and some redo", st)
+	}
 	if got := queryRows(t, e, "SELECT id, bal FROM acc"); got != "1,100;2,999;3,300" {
 		t.Fatalf("after recovery: got %s, want loser undone and winner kept: 1,100;2,999;3,300", got)
 	}
@@ -94,7 +96,6 @@ func TestUndoRecovery_ExplicitRollbackStaysRolledBack(t *testing.T) {
 
 // 二级索引: 失败者的 UPDATE 在索引树里新增了一项 (索引项只增不删)，撤销时必须把这一项删掉。
 func TestUndoRecovery_SecondaryIndexEntriesUndone(t *testing.T) {
-	pending(t, "10.2")
 	path := filepath.Join(t.TempDir(), "undo3.db")
 	e := openRecoveryEngine(t, path)
 	setupAccounts(t, e)

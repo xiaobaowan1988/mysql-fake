@@ -57,8 +57,12 @@ func PendingUndos(losers []Loser) []Record {
 	return all
 }
 
-// Recover 正向回放日志中的 Update 记录。页上的 LSN >= 记录 LSN 说明该修改已落盘，跳过，
-// 因此重放是幂等的。完成后刷盘并截断日志。返回实际重放的记录数。
+// Recover 是恢复的 Redo 阶段: 正向回放日志中的**全部** Update 记录 (包括失败者的，使页回到崩溃瞬间的样子)。
+// 页上的 LSN >= 记录 LSN 说明该修改已落盘，跳过，因此重放是幂等的。完成后把页刷盘。
+// 返回实际重放的记录数。
+//
+// 它不截断日志: 日志里还有失败者的 Undo 记录，必须保留到撤销完成。调用方在 Undo 阶段结束后
+// 做 Checkpoint 来截断日志 (Checkpoint 保证脏页都已落盘)。
 func Recover(disk *storage.DiskManager, lm *LogManager) (int, error) {
 	recs := lm.Records()
 	if len(recs) == 0 {
@@ -107,5 +111,5 @@ func Recover(disk *storage.DiskManager, lm *LogManager) (int, error) {
 	if err := disk.Sync(); err != nil {
 		return 0, err
 	}
-	return redone, lm.Truncate()
+	return redone, nil
 }

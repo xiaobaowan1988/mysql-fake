@@ -68,6 +68,8 @@ type Engine struct {
 	ddlMu   sync.Mutex // 串行化在线 DDL
 	ddlMu2  sync.Mutex // 保护 ddlHook
 	ddlHook func(stage string)
+
+	recovery RecoveryStats // 打开时的崩溃恢复统计
 }
 
 // SetWriteGuard 设置写入守卫: 每条写语句执行前调用，返回错误则拒绝 (集群中用于只读副本)。
@@ -118,7 +120,10 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 		d.Close()
 		return nil, err
 	}
-	if _, err := wal.Recover(d, lm); err != nil {
+	// 崩溃恢复三阶段: Analysis (找出失败者) -> Redo (重放全部历史) -> Undo (撤销失败者，需要 B+ 树，故在 Catalog 就绪之后)。
+	losers := wal.Analyze(lm.Records())
+	redone, err := wal.Recover(d, lm)
+	if err != nil {
 		return fail(err)
 	}
 	pool := buffer.New(d, lm, opts.PoolSize)
@@ -126,11 +131,17 @@ func OpenWithOptions(path string, opts Options) (*Engine, error) {
 	if err != nil {
 		return fail(err)
 	}
-	// 首次创建 Catalog 时文件头先于系统树页落盘，这里立即做一次 Checkpoint 保证二者一致。
+	undone, err := undoLosers(pool, lm, losers)
+	if err != nil {
+		return fail(err)
+	}
+	// 首次创建 Catalog 时文件头先于系统树页落盘，这里立即做一次 Checkpoint 保证二者一致；
+	// 恢复产生的日志 (含 Undo 阶段的修改和 Abort 记录) 也在这里被截断。
 	if err := pool.Checkpoint(); err != nil {
 		return fail(err)
 	}
-	e := &Engine{path: path, disk: d, log: lm, pool: pool, cat: cat, mgr: txn.NewManager(d, pool)}
+	e := &Engine{path: path, disk: d, log: lm, pool: pool, cat: cat, mgr: txn.NewManager(d, pool),
+		recovery: RecoveryStats{Redone: redone, Losers: len(losers), Undone: undone}}
 	if !opts.NoBinlog {
 		if e.bl, err = binlog.Open(path + ".binlog"); err != nil {
 			return fail(err)

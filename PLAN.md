@@ -207,12 +207,13 @@
   从节点应用复制日志同样经过 `txn.Manager`，自动获得此能力；Raft 日志与 Binlog 只在提交时生成，失败者不会出现在其中。
 - 实现备注 (10.1): `RecUndo` 记录没有 Before 部分，载荷编码在 `After` 里 (`wal.UndoInfo`)；`Analyze` 返回的失败者按第一条 Undo 记录的 LSN 排序，`PendingUndos` 给出执行顺序 (LSN 倒序)。
   二级索引项在 `AddUndo` 之前就已写入索引树 (`addIndexEntries` 先于 `AddUndo`)，如果恰好在这两步之间崩溃，只会留下一个无害的孤儿索引项 (读取时回表校验，Phase 9 已有此特性)。
+- 实现备注 (10.2): 恢复入口在 `db/recovery.go` (`undoLosers`/`applyUndo`)；`Engine.RecoveryStats()` 给出本次打开时的 Redo/失败者/撤销数量；包级测试钩子 `undoStepHook` 用于模拟撤销过程中崩溃。
 - 测试: `db/undo_recovery_test.go`，验收场景见各测试注释。未实现的步骤用 `pending()` 标记，默认跳过，`MYFAKE_PENDING=1` 强制运行 (用于确认它们现在失败)；完成对应步骤时删除标记。
 - [x] **10.1 Undo 日志持久化与 Analysis**
   - [x] 新增 `RecUndo` 日志记录 (编码/解码/恢复读取)，`Txn.AddUndo` 先写日志
   - [x] Analysis: 从日志找出失败者及其 undo 记录
-- [ ] **10.2 Undo 阶段**
-  - [ ] `wal.Recover` 只做 Analysis + Redo 且不截断；`Engine.Open` 在 Catalog 就绪后逻辑撤销失败者 (含二级索引项)，写 `RecAbort` 后 Checkpoint
+- [x] **10.2 Undo 阶段**
+  - [x] `wal.Recover` 只做 Redo 且不截断 (Analysis 由 `wal.Analyze` 在它之前完成)；`Engine.Open` 在 Catalog 就绪后逻辑撤销失败者 (含二级索引项)，写 `RecAbort` 并刷日志后 Checkpoint
 - [ ] **10.3 检查点与关闭的联动**
   - [ ] 记录 firstUndoLSN，Fuzzy/Sharp Checkpoint 的截断点不越过活跃写事务的 undo 记录；优雅关闭保留未结束事务的日志
 - [ ] **10.4 可重启与压力测试，并更新旧限制**
