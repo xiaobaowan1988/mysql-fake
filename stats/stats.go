@@ -447,6 +447,28 @@ func (s *Store) Set(table string, ts *TableStats) {
 	s.mods[k] = 0
 }
 
+// Mods 返回自上次采样以来累计的修改数。
+func (s *Store) Mods(table string) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mods[strings.ToLower(table)]
+}
+
+// SetSampled 保存一次采样的结果。modsAtStart 是采样开始前读到的修改数: 只扣掉这部分
+// (它们已经反映在这次采样里)，采样期间新到达的修改保留下来，仍会触发下一次重新采样。
+// (Set 直接清零，会把采样期间的修改一并丢掉。)
+func (s *Store) SetSampled(table string, ts *TableStats, modsAtStart int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := strings.ToLower(table)
+	s.tables[k] = ts
+	if rest := s.mods[k] - modsAtStart; rest > 0 {
+		s.mods[k] = rest
+	} else {
+		s.mods[k] = 0
+	}
+}
+
 func (s *Store) AddMods(table string, n int64) {
 	s.mu.Lock()
 	s.mods[strings.ToLower(table)] += n

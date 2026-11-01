@@ -25,6 +25,7 @@ func (e *Engine) Analyze(table string) error {
 	if size <= 0 {
 		size = 10000
 	}
+	modsAtStart := e.stats.Mods(ti.Name) // 采样期间到达的修改要保留 (见 Store.SetSampled)
 	tx, err := e.mgr.Begin()
 	if err != nil {
 		return err
@@ -50,7 +51,7 @@ func (e *Engine) Analyze(table string) error {
 		}
 		sm.Add(r.Values, n)
 	}
-	e.stats.Set(ti.Name, sm.Build(ti.Schema))
+	e.stats.SetSampled(ti.Name, sm.Build(ti.Schema), modsAtStart)
 	return nil
 }
 
