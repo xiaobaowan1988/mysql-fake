@@ -20,7 +20,8 @@ type RecoveryStats struct {
 func (e *Engine) RecoveryStats() RecoveryStats { return e.recovery }
 
 // undoStepHook 是测试钩子: 在每一条撤销记录执行之前调用，返回错误则中止恢复 (用来模拟撤销过程中崩溃)。
-var undoStepHook func(step int) error
+// 钩子拿到缓冲池和日志，可以先把已完成的那部分撤销刷盘，模拟"崩溃时撤销只做了一半、且已经落盘"。
+var undoStepHook func(step int, pool *buffer.Pool, lm *wal.LogManager) error
 
 // undoLosers 是恢复的第三阶段 (Undo): 按 LSN 从大到小对失败者的每条 Undo 记录做逻辑撤销，
 // 然后给每个失败者写 Abort 记录并把日志刷盘。
@@ -37,7 +38,7 @@ func undoLosers(pool *buffer.Pool, lm *wal.LogManager, losers []wal.Loser) (int,
 			return n, fmt.Errorf("recovery: corrupt undo record at LSN %d (txn %d)", r.LSN, r.TxnID)
 		}
 		if undoStepHook != nil {
-			if err := undoStepHook(n); err != nil {
+			if err := undoStepHook(n, pool, lm); err != nil {
 				return n, err
 			}
 		}

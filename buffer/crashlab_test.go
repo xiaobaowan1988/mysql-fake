@@ -62,7 +62,8 @@ func TestLab3_LostCommitRecordButUpdatesReplayed(t *testing.T) {
 	if last.Type != wal.RecUpdate {
 		t.Fatalf("test setup: the torn commit record should have been dropped, last record type=%d", last.Type)
 	}
-	// 记录已知限制: 恢复只重放 Update、不看提交记录，所以没有提交记录的修改也会留下 (PLAN.md Phase 3 已知限制)
+	// 记录已知限制: wal.Recover (Redo) 只重放 Update、不看提交记录，所以没有提交记录的修改也会留下 (PLAN.md Phase 3 已知限制)；
+	// 引擎层靠 Undo 记录在 Redo 之后撤销这样的失败者 (Phase 10，见 db/undo_recovery_test.go)，缓冲池/WAL 这一层不知道事务。
 	if n := keysAfterRecovery(t, e.path, root); n != 50 {
 		t.Fatalf("documented behaviour changed: got %d keys, want 50", n)
 	}
