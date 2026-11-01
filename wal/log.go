@@ -20,9 +20,11 @@ const (
 	RecUpdate RecType = 1 // 页内 [Offset, Offset+len) 字节区间的变化
 	RecCommit RecType = 2
 	RecAbort  RecType = 3
+	RecUndo   RecType = 4 // 逻辑 undo 信息 (Phase 10): 事务在修改数据之前写入，载荷见 UndoInfo
 )
 
 // Record 是一条 WAL 日志。Update 记录携带 Before/After 镜像 (等长)。
+// Undo 记录只用 After 存放载荷 (UndoInfo 的编码)，没有 Before。
 type Record struct {
 	LSN    uint64
 	TxnID  uint64
@@ -36,6 +38,8 @@ type Record struct {
 // 文件格式: 文件头 magic(8) baseLSN(8)，随后是连续的记录:
 //
 //	bodyLen(4) crc32(4) | lsn(8) txn(8) type(1) page(4) offset(2) n(2) before(n) after(n)
+//
+// Undo 记录没有 before 部分: ... n(2) payload(n)。
 const (
 	logMagic      = "MYFAKWAL"
 	logHeaderSize = 16
@@ -44,14 +48,21 @@ const (
 
 func (r *Record) encode() []byte {
 	n := len(r.After)
-	body := make([]byte, recFixed, recFixed+2*n)
+	hasBefore := r.Type != RecUndo
+	size := recFixed + n
+	if hasBefore {
+		size += n
+	}
+	body := make([]byte, recFixed, size)
 	binary.LittleEndian.PutUint64(body[0:], r.LSN)
 	binary.LittleEndian.PutUint64(body[8:], r.TxnID)
 	body[16] = byte(r.Type)
 	binary.LittleEndian.PutUint32(body[17:], uint32(r.PageID))
 	binary.LittleEndian.PutUint16(body[21:], r.Offset)
 	binary.LittleEndian.PutUint16(body[23:], uint16(n))
-	body = append(body, r.Before...)
+	if hasBefore {
+		body = append(body, r.Before...)
+	}
 	body = append(body, r.After...)
 	out := make([]byte, 8, 8+len(body))
 	binary.LittleEndian.PutUint32(out[0:], uint32(len(body)))
@@ -64,21 +75,136 @@ func decodeBody(body []byte) (Record, bool) {
 		return Record{}, false
 	}
 	n := int(binary.LittleEndian.Uint16(body[23:]))
-	if len(body) != recFixed+2*n {
+	typ := RecType(body[16])
+	want := recFixed + 2*n
+	if typ == RecUndo {
+		want = recFixed + n
+	}
+	if len(body) != want {
 		return Record{}, false
 	}
 	r := Record{
 		LSN:    binary.LittleEndian.Uint64(body[0:]),
 		TxnID:  binary.LittleEndian.Uint64(body[8:]),
-		Type:   RecType(body[16]),
+		Type:   typ,
 		PageID: storage.PageID(binary.LittleEndian.Uint32(body[17:])),
 		Offset: binary.LittleEndian.Uint16(body[21:]),
 	}
-	if n > 0 {
+	switch {
+	case n == 0:
+	case typ == RecUndo:
+		r.After = bytes.Clone(body[recFixed:])
+	default:
 		r.Before = bytes.Clone(body[recFixed : recFixed+n])
 		r.After = bytes.Clone(body[recFixed+n:])
 	}
 	return r, true
+}
+
+// UndoInfo 是一条逻辑 undo 记录的持久化形式: 回滚 = 对 Root 指向的 B+ 树做
+// Put(Key, OldValue) (Kind 为更新/删除) 或 Delete(Key) (Kind 为插入)，再删除 Idx 中本次新增的索引项。
+// 树用根页号标识 (根页号在树的整个生命周期内不变)，因此恢复时不依赖 Catalog。
+type UndoInfo struct {
+	Kind     uint8 // 与 txn.UndoKind 取值一致: 1 插入 2 更新 3 删除
+	Root     storage.PageID
+	Key      []byte
+	OldValue []byte
+	Idx      []UndoIdx
+}
+
+// UndoIdx 指向二级索引树中的一个索引项。
+type UndoIdx struct {
+	Root storage.PageID
+	Key  []byte
+}
+
+// Marshal 编码: kind(1) root(4) keyLen(2) key valLen(2) val idxCount(2) { root(4) keyLen(2) key }*
+func (u *UndoInfo) Marshal() []byte {
+	b := make([]byte, 0, 1+4+2+len(u.Key)+2+len(u.OldValue)+2)
+	b = append(b, u.Kind)
+	b = binary.LittleEndian.AppendUint32(b, uint32(u.Root))
+	b = binary.LittleEndian.AppendUint16(b, uint16(len(u.Key)))
+	b = append(b, u.Key...)
+	b = binary.LittleEndian.AppendUint16(b, uint16(len(u.OldValue)))
+	b = append(b, u.OldValue...)
+	b = binary.LittleEndian.AppendUint16(b, uint16(len(u.Idx)))
+	for _, ix := range u.Idx {
+		b = binary.LittleEndian.AppendUint32(b, uint32(ix.Root))
+		b = binary.LittleEndian.AppendUint16(b, uint16(len(ix.Key)))
+		b = append(b, ix.Key...)
+	}
+	return b
+}
+
+// ParseUndo 解出 Undo 记录的载荷；格式不对返回 false。
+func ParseUndo(r *Record) (UndoInfo, bool) {
+	if r.Type != RecUndo {
+		return UndoInfo{}, false
+	}
+	b := r.After
+	var u UndoInfo
+	take := func(n int) ([]byte, bool) {
+		if n < 0 || len(b) < n {
+			return nil, false
+		}
+		out := b[:n]
+		b = b[n:]
+		return out, true
+	}
+	u16 := func() (int, bool) {
+		x, ok := take(2)
+		if !ok {
+			return 0, false
+		}
+		return int(binary.LittleEndian.Uint16(x)), true
+	}
+	hdr, ok := take(5)
+	if !ok {
+		return UndoInfo{}, false
+	}
+	u.Kind = hdr[0]
+	u.Root = storage.PageID(binary.LittleEndian.Uint32(hdr[1:]))
+	kl, ok := u16()
+	if !ok {
+		return UndoInfo{}, false
+	}
+	key, ok := take(kl)
+	if !ok {
+		return UndoInfo{}, false
+	}
+	u.Key = bytes.Clone(key)
+	vl, ok := u16()
+	if !ok {
+		return UndoInfo{}, false
+	}
+	val, ok := take(vl)
+	if !ok {
+		return UndoInfo{}, false
+	}
+	u.OldValue = bytes.Clone(val)
+	cnt, ok := u16()
+	if !ok {
+		return UndoInfo{}, false
+	}
+	for i := 0; i < cnt; i++ {
+		rt, ok := take(4)
+		if !ok {
+			return UndoInfo{}, false
+		}
+		il, ok := u16()
+		if !ok {
+			return UndoInfo{}, false
+		}
+		ik, ok := take(il)
+		if !ok {
+			return UndoInfo{}, false
+		}
+		u.Idx = append(u.Idx, UndoIdx{Root: storage.PageID(binary.LittleEndian.Uint32(rt)), Key: bytes.Clone(ik)})
+	}
+	if len(b) != 0 {
+		return UndoInfo{}, false
+	}
+	return u, true
 }
 
 var ErrBadLog = errors.New("wal: not a log file")
@@ -177,6 +303,12 @@ func (lm *LogManager) Append(r *Record) uint64 {
 	lm.nextLSN++
 	lm.buf = append(lm.buf, r.encode()...)
 	return r.LSN
+}
+
+// AppendUndo 追加一条 Undo 记录 (r.Type 被设为 RecUndo)。调用方必须在修改数据页之前调用 (WAL 规则)。
+func (lm *LogManager) AppendUndo(r *Record) uint64 {
+	r.Type = RecUndo
+	return lm.Append(r)
 }
 
 // Flush 保证 LSN <= upTo 的记录已 fsync 落盘。

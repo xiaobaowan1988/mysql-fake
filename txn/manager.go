@@ -11,6 +11,7 @@ import (
 	"mysqlfake/binlog"
 	"mysqlfake/btree"
 	"mysqlfake/metrics"
+	"mysqlfake/wal"
 )
 
 var ErrTxnFinished = errors.New("txn: transaction already finished")
@@ -25,6 +26,8 @@ type IDStore interface {
 type Logger interface {
 	Commit(txnID uint64) error
 	Abort(txnID uint64)
+	// LogUndo 写入逻辑 undo 记录，必须先于它所描述的数据修改 (崩溃恢复据此撤销未提交的事务)。
+	LogUndo(txnID uint64, info wal.UndoInfo) uint64
 }
 
 const idReserve = 1000
@@ -225,6 +228,11 @@ func (t *Txn) LockWaitTime() time.Duration { return time.Duration(t.lockWait.Loa
 // idxAdds 是这次修改新增的二级索引项 (回滚时会被删除)。
 func (t *Txn) AddUndo(kind UndoKind, table string, tree *btree.Tree, key, oldValue, newRow []byte, idxAdds ...IdxRef) uint64 {
 	t.noteWrite()
+	info := wal.UndoInfo{Kind: uint8(kind), Root: tree.Root(), Key: key, OldValue: oldValue}
+	for _, ix := range idxAdds {
+		info.Idx = append(info.Idx, wal.UndoIdx{Root: ix.Tree.Root(), Key: ix.Key})
+	}
+	t.mgr.log.LogUndo(t.ID, info) // 先写 undo 日志，再 (由调用方) 修改数据
 	id := t.mgr.Undo.add(&UndoRecord{
 		TxnID: t.ID, Kind: kind, Table: table, Tree: tree,
 		Key: append([]byte(nil), key...), OldValue: append([]byte(nil), oldValue...),

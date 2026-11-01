@@ -367,6 +367,12 @@ func (p *Pool) DirtyCount() int {
 	return n
 }
 
+// LogUndo 把一条逻辑 undo 记录写入日志 (不刷盘)，返回它的 LSN。
+// WAL 规则: 必须先于它所描述的数据修改调用，这样任何已落盘的页修改，其 undo 记录一定已先落盘。
+func (p *Pool) LogUndo(txnID uint64, info wal.UndoInfo) uint64 {
+	return p.log.AppendUndo(&wal.Record{TxnID: txnID, After: info.Marshal()})
+}
+
 // Abort 写入回滚记录 (不需要立即刷盘)。
 func (p *Pool) Abort(txnID uint64) {
 	p.log.Append(&wal.Record{Type: wal.RecAbort, TxnID: txnID})

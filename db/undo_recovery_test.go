@@ -3,7 +3,11 @@ package db
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"mysqlfake/txn"
+	"mysqlfake/wal"
 )
 
 // Phase 10 (崩溃时回滚未提交事务) 的验收测试。
@@ -161,5 +165,48 @@ func TestUndoRecovery_GracefulCloseWithOpenTxn(t *testing.T) {
 	defer e.Close()
 	if got := queryRows(t, e, "SELECT id, bal FROM acc"); got != "1,100;2,200;3,300" {
 		t.Fatalf("got %s, want the open transaction's change undone", got)
+	}
+}
+
+// 10.1: 失败者的逻辑 undo 记录已经写进了崩溃后仍然存在的日志里，并且 Analysis 能把它找出来。
+func TestUndoLogged_LoserIsFoundByAnalysis(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "undo0.db")
+	e := openRecoveryEngine(t, path)
+	setupAccounts(t, e)
+	ti, err := e.cat.GetTable("acc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := ti.Tree.Root()
+
+	loser, winner := e.NewSession(), e.NewSession()
+	sexec(t, loser, "BEGIN")
+	sexec(t, loser, "UPDATE acc SET bal = 0 WHERE id = 1")
+	sexec(t, loser, "DELETE FROM acc WHERE id = 3")
+	sexec(t, loser, "INSERT INTO acc VALUES (4,400,'d')")
+	sexec(t, winner, "UPDATE acc SET bal = 999 WHERE id = 2")
+	e.crash()
+
+	recs, err := wal.ReadFile(path + ".wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	losers := wal.Analyze(recs)
+	if len(losers) != 1 {
+		t.Fatalf("want exactly one loser (the winner committed), got %d", len(losers))
+	}
+	var kinds []uint8
+	for _, r := range losers[0].Undos {
+		info, ok := wal.ParseUndo(&r)
+		if !ok {
+			t.Fatalf("undo record at LSN %d does not parse", r.LSN)
+		}
+		if info.Root != root {
+			t.Fatalf("undo record points at tree %d, want the acc table %d", info.Root, root)
+		}
+		kinds = append(kinds, info.Kind)
+	}
+	if want := []uint8{uint8(txn.UndoUpdate), uint8(txn.UndoDelete), uint8(txn.UndoInsert)}; !reflect.DeepEqual(kinds, want) {
+		t.Fatalf("undo kinds in log order = %v, want %v", kinds, want)
 	}
 }
